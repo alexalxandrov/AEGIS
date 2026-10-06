@@ -47,6 +47,18 @@ def cmd_check(a):
         c.execute("INSERT OR REPLACE INTO source_health VALUES(?,?,strftime('%s','now'),?)", (n, ok, note))
         print(f"[{'ok' if ok else '!!'}] {n} {note}")
 
+def cmd_run(a):
+    from . import runner
+    runner.run_org(db.connect(), a.org)
+
+def cmd_assets(a):
+    c = db.connect()
+    for r in c.execute("SELECT id,kind,value,scope,existence_conf e,attribution_conf a FROM asset ORDER BY kind,value"):
+        print(f"{r['id']:>4} {r['kind']:<7} {r['scope']:<11} e={r['e']:.1f} a={r['a']:.1f}  {r['value']}")
+
+def cmd_scope(a):
+    c = db.connect(); scope.set_scope(c, a.asset_id, a.state); print("ok")
+
 def main():
     p = argparse.ArgumentParser("aegis"); s = p.add_subparsers(dest="cmd", required=True)
     s.add_parser("init").set_defaults(f=cmd_init)
@@ -55,6 +67,9 @@ def main():
     x = s.add_parser("seed"); x.add_argument("org"); x.add_argument("kind", choices=["domain", "asn", "cidr"]); x.add_argument("value")
     x.add_argument("--verified", action="store_true"); x.set_defaults(f=cmd_seed)
     x = s.add_parser("probe"); x.add_argument("asset_id", type=int); x.set_defaults(f=cmd_probe)
+    x = s.add_parser("run"); x.add_argument("org"); x.set_defaults(f=cmd_run)
+    s.add_parser("assets").set_defaults(f=cmd_assets)
+    x = s.add_parser("scope"); x.add_argument("asset_id", type=int); x.add_argument("state", choices=sorted(scope.STATES)); x.set_defaults(f=cmd_scope)
     a = p.parse_args(); a.f(a)
 
 if __name__ == "__main__": main()
