@@ -49,7 +49,7 @@ def cmd_check(a):
 
 def cmd_run(a):
     from . import runner
-    runner.run_org(db.connect(), a.org)
+    runner.run_org(db.connect(), a.org, limit=a.limit)
 
 def cmd_assets(a):
     c = db.connect()
@@ -67,7 +67,7 @@ def main():
     x = s.add_parser("seed"); x.add_argument("org"); x.add_argument("kind", choices=["domain", "asn", "cidr"]); x.add_argument("value")
     x.add_argument("--verified", action="store_true"); x.set_defaults(f=cmd_seed)
     x = s.add_parser("probe"); x.add_argument("asset_id", type=int); x.set_defaults(f=cmd_probe)
-    x = s.add_parser("run"); x.add_argument("org"); x.set_defaults(f=cmd_run)
+    x = s.add_parser("run"); x.add_argument("org"); x.add_argument("--limit", type=int, default=300); x.set_defaults(f=cmd_run)
     s.add_parser("assets").set_defaults(f=cmd_assets)
     x = s.add_parser("scope"); x.add_argument("asset_id", type=int); x.add_argument("state", choices=sorted(scope.STATES)); x.set_defaults(f=cmd_scope)
     a = p.parse_args(); a.f(a)

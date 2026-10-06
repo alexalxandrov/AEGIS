@@ -12,8 +12,8 @@ def dig(name, rtype, resolver):
             except OSError: return []
         return []
     try:
-        p = subprocess.run(["dig", "+short", "+time=3", "+tries=1", f"@{resolver}", name, rtype],
-                           capture_output=True, text=True, timeout=10)
+        p = subprocess.run(["dig", "+short", "+time=2", "+tries=1", f"@{resolver}", name, rtype],
+                           capture_output=True, text=True, timeout=6)
         return sorted({l.strip().lower().rstrip(".") for l in p.stdout.splitlines() if l.strip() and not l.startswith(";")})
     except Exception:
         return None  # ошибка резолвера
@@ -27,9 +27,10 @@ def resolve(name, rtype, resolvers=RESOLVERS, fn=dig):
 
 class DNS(Tentacle):
     name = "dns"
+    def __init__(self, types=None): self.types = types or TYPES
     def run(self, conn, asset):
         out = []
-        for t in TYPES:
+        for t in self.types:
             r = resolve(asset["value"], t)
             if r["values"]:
                 out.append({"key": f"dns_{t}", "value": r["values"], "agree": r["agree"]})

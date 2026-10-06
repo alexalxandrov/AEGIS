@@ -1,5 +1,5 @@
 """CT через crt.sh: кэш на диске + ретраи. Пассивный."""
-import json, time, hashlib, urllib.request, urllib.parse
+import re, json, time, hashlib, urllib.request, urllib.parse
 from .. import config
 from ..tentacle import Tentacle
 
@@ -18,12 +18,14 @@ def fetch_json(url, retries=3):
             err = e; time.sleep(2 * (i + 1))
     raise err
 
+HOST = re.compile(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$')
+
 def names_from_rows(rows, domain):
     out = {}
     for r in rows:
         for n in str(r.get("name_value", "")).splitlines():
             n = n.strip().lower().lstrip("*.").rstrip(".")
-            if n == domain or n.endswith("." + domain):
+            if HOST.match(n) and (n == domain or n.endswith("." + domain)):
                 o = out.setdefault(n, {"certs": set(), "issuer": r.get("issuer_name", "")})
                 o["certs"].add(r.get("id"))
     return out
