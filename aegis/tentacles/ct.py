@@ -1,5 +1,5 @@
 """CT через crt.sh: кэш на диске + ретраи. Пассивный."""
-import re, json, time, hashlib, urllib.request, urllib.parse
+import re, json, time, hashlib, urllib.request, urllib.parse, urllib.error
 from .. import config
 from ..tentacle import Tentacle
 
@@ -14,6 +14,9 @@ def fetch_json(url, retries=3):
             req = urllib.request.Request(url, headers={"User-Agent": config.USER_AGENT})
             data = json.load(urllib.request.urlopen(req, timeout=60))
             cf.write_text(json.dumps(data)); return data
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500 and e.code != 429: raise
+            err = e; time.sleep(2 * (i + 1))
         except Exception as e:
             err = e; time.sleep(2 * (i + 1))
     raise err

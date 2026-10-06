@@ -13,7 +13,16 @@ class T(unittest.TestCase):
         store.upsert_asset(c,1,"domain","test.com",1,1,"VERIFIED"); c.execute("INSERT INTO seed(org_id,kind,value,verified) VALUES(1,'domain','test.com',1)")
         ctf=lambda c,a:[{"asset_value":n,"key":"ct_certs","value":sorted(v["certs"])} for n,v in ct.names_from_rows(ROWS,"test.com").items()]
         dnf=lambda c,a:[{"key":"dns_A","value":["9.9.9.9"],"agree":True}]
-        s1=runner.run_org(c,"o",log=lambda *_:0,ct_fn=ctf,dns_fn=dnf); s2=runner.run_org(c,"o",log=lambda *_:0,ct_fn=ctf,dns_fn=dnf)
+        ipf=lambda ip:[{"key":"bgp","value":{"prefix":"9.9.9.0/24","asns":[{"asn":13335,"holder":"CLOUDFLARENET"}]}}]; domf=lambda d:[{"key":"rdap","value":{"ns":[]}}]
+        kw=dict(log=lambda *_:0,ct_fn=ctf,dns_fn=dnf,ip_fn=ipf,dom_fn=domf)
+        s1=runner.run_org(c,"o",**kw); s2=runner.run_org(c,"o",**kw)
+        self.assertEqual(c.execute("SELECT scope FROM asset WHERE value='9.9.9.9'").fetchone()[0],"THIRD_PARTY")
         self.assertGreater(s1["obs_new"],0); self.assertEqual(s2["obs_new"],0); self.assertEqual(s2["assets_new"],0)
         self.assertEqual(c.execute("SELECT count(*) FROM edge WHERE rel='resolves_to'").fetchone()[0],3)
+
+
+class T2(unittest.TestCase):
+    def test_fallback_system(self):
+        f=lambda n,t,r: None if r!="system" else ["5.5.5.5"]
+        r=dns.resolve("x","A",["1.1.1.1","8.8.8.8"],f); self.assertEqual(r["values"],["5.5.5.5"])
 if __name__=="__main__": unittest.main()
