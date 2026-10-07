@@ -83,6 +83,14 @@ def cmd_web(a):
     from . import runner
     runner.probe_org(db.connect(), a.org)
 
+def cmd_digest(a):
+    from . import digest
+    c = db.connect(); o = c.execute("SELECT id FROM organization WHERE name=?", (a.org,)).fetchone()
+    if not o: sys.exit("нет организации")
+    md = digest.make(c, o["id"], a.hours, use_llm=not a.no_llm)
+    import datetime
+    f = config.DATA_DIR / f"digest_{a.org}_{datetime.date.today()}.md"; f.write_text(md); print(md); print("\nсохранено:", f)
+
 def main():
     p = argparse.ArgumentParser("aegis"); s = p.add_subparsers(dest="cmd", required=True)
     s.add_parser("init").set_defaults(f=cmd_init)
@@ -98,6 +106,7 @@ def main():
     x = s.add_parser("diff"); x.add_argument("org"); x.add_argument("--hours", type=float, default=24); x.set_defaults(f=cmd_diff)
     s.add_parser("findings").set_defaults(f=cmd_findings)
     x = s.add_parser("web"); x.add_argument("org"); x.set_defaults(f=cmd_web)
+    x = s.add_parser("digest"); x.add_argument("org"); x.add_argument("--hours", type=float, default=48); x.add_argument("--no-llm", action="store_true"); x.set_defaults(f=cmd_digest)
     a = p.parse_args(); a.f(a)
 
 if __name__ == "__main__": main()
