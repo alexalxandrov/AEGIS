@@ -79,6 +79,10 @@ def cmd_findings(a):
     for r in c.execute("SELECT f.id,f.severity,f.kind,f.state,a.value FROM finding f JOIN asset a ON a.id=f.asset_id ORDER BY f.id DESC LIMIT 50"):
         print(f"#{r['id']} {r['severity']:<8} {r['kind']:<16} {r['state']:<6} {r['value']}")
 
+def cmd_web(a):
+    from . import runner
+    runner.probe_org(db.connect(), a.org)
+
 def main():
     p = argparse.ArgumentParser("aegis"); s = p.add_subparsers(dest="cmd", required=True)
     s.add_parser("init").set_defaults(f=cmd_init)
@@ -93,6 +97,7 @@ def main():
     x = s.add_parser("dns"); x.add_argument("name"); x.set_defaults(f=cmd_dns)
     x = s.add_parser("diff"); x.add_argument("org"); x.add_argument("--hours", type=float, default=24); x.set_defaults(f=cmd_diff)
     s.add_parser("findings").set_defaults(f=cmd_findings)
+    x = s.add_parser("web"); x.add_argument("org"); x.set_defaults(f=cmd_web)
     a = p.parse_args(); a.f(a)
 
 if __name__ == "__main__": main()

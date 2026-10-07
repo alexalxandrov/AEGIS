@@ -77,3 +77,28 @@ def enrich(c, org, seed_ids, stats, log, ip_fn, dom_fn, workers):
                         if intel.is_third_party(x["asn"], x["holder"]):
                             c.execute("UPDATE asset SET scope='THIRD_PARTY' WHERE id=? AND scope='CANDIDATE'", (a["id"],))
                             store.observe(c, a["id"], "intel", "third_party", f"AS{x['asn']} {x['holder']}")
+
+
+def probe_org(c, org_name, log=print, web_fn=None, workers=4):
+    """Активные пробы: только VERIFIED домены; каждая проба сначала проходит scope.require_active."""
+    from . import scope
+    from .tentacles import web
+    o = c.execute("SELECT id FROM organization WHERE name=?", (org_name,)).fetchone()
+    if not o: raise SystemExit("нет организации")
+    org = o["id"]; ok = []
+    for a in c.execute("SELECT id,value,scope FROM asset WHERE org_id=? AND kind='domain'", (org,)).fetchall():
+        try: scope.require_active(c, a["id"], "web", "http_tls_probe"); ok.append(a)
+        except scope.ScopeDenied: pass
+    log(f"[web] VERIFIED доменов: {len(ok)} (остальные пропущены scope-ядром)")
+    st = {"probed": 0, "obs_new": 0, "san_new": 0}
+    with ThreadPoolExecutor(workers) as ex:
+        for a, items in zip(ok, ex.map(lambda a: (web_fn or web.Web().run)(None, a), ok)):
+            st["probed"] += 1
+            for it in items:
+                st["obs_new"] += store.observe(c, a["id"], "web", it["key"], it["value"])
+                if it["key"] == "tls" and it["value"].get("valid"):
+                    for n in it["value"]["san"]:
+                        if "*" in n or n == a["value"]: continue
+                        nid, new = store.upsert_asset(c, org, "domain", n, existence=0.8, attribution=0.7); st["san_new"] += new
+                        store.edge(c, a["id"], nid, "san_of")
+    log(f"готово: {st}"); return st

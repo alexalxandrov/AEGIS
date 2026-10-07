@@ -34,6 +34,14 @@ def classify(asset, key, old, new):
     if key == "rdap" and new:
         if old.get("ns") != new.get("ns"): return ("RDAP_NS_CHANGE", "high", f"{n}: NS в RDAP {old.get('ns')} -> {new.get('ns')}")
         if old.get("status") != new.get("status"): return ("RDAP_STATUS", "medium", f"{n}: статус {old.get('status')} -> {new.get('status')}")
+    if key == "tls" and old.get("valid") and new.get("valid"):
+        if old.get("issuer") != new.get("issuer"): return ("CERT_ISSUER_CHANGE", "medium", f"{n}: издатель {old.get('issuer')} -> {new.get('issuer')}")
+        if old.get("serial") != new.get("serial"): return ("CERT_CHANGE", "info", f"{n}: сертификат обновлён")
+    if key in ("http_443", "http_80") and "sec" in old and "sec" in new:
+        lost = [k for k, v in old["sec"].items() if v and not new["sec"].get(k)]
+        if lost: return ("HEADER_REMOVED", "medium", f"{n}: пропали заголовки {lost}")
+        if old.get("status") != new.get("status"): return ("HTTP_STATUS_CHANGE", "low", f"{n}: {key} статус {old.get('status')} -> {new.get('status')}")
+        if old.get("server") != new.get("server"): return ("SERVER_CHANGE", "low", f"{n}: Server {old.get('server')!r} -> {new.get('server')!r}")
     if key == "ct_certs": return ("NEW_CERTS", "info", f"{n}: новые сертификаты ({len(new)} всего)")
     return None
 
@@ -46,6 +54,17 @@ def static_checks(c, org_id):
         if d is not None and d < 30:
             out.append({"asset_id": r["id"], "kind": "DOMAIN_EXPIRING", "severity": "high" if d >= 0 else "critical",
                         "text": f"{r['value']}: домен истекает через {d} дн.", "obs": []})
+    for r in c.execute("SELECT a.id,a.value,o.key,o.value v FROM asset a JOIN observation o ON o.asset_id=a.id AND o.source='web' "
+                       "WHERE a.org_id=? AND o.id=(SELECT MAX(id) FROM observation WHERE asset_id=a.id AND source='web' AND key=o.key)", (org_id,)):
+        v = _j(r["v"]); n = r["value"]; add = lambda k, sv, t: out.append({"asset_id": r["id"], "kind": k, "severity": sv, "text": f"{n}: {t}", "obs": []})
+        if r["key"] == "tls":
+            if not v.get("valid"): add("TLS_INVALID", "high", f"сертификат не проходит проверку ({v.get('error')})")
+            else:
+                d = _days_left(v.get("not_after"))
+                if d is not None and d < 21: add("CERT_EXPIRING", "critical" if d < 0 else "high", f"сертификат истекает через {d} дн.")
+        elif r["key"] == "http_443" and v.get("sec") is not None and not v["sec"].get("hsts"): add("NO_HSTS", "low", "нет HSTS")
+        elif r["key"] == "http_80" and v.get("status") and not (300 <= v["status"] < 400 and str(v.get("location", "")).startswith("https")):
+            add("NO_HTTPS_REDIRECT", "medium", "HTTP :80 не перенаправляет на HTTPS")
     return out
 
 def compute(c, org_id, since):
