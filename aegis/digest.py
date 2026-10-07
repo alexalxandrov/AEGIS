@@ -3,7 +3,7 @@ import re, json, time, datetime
 from . import diff, config
 
 SYS = ("Ты аналитик внешней поверхности атаки. Используй ТОЛЬКО перечисленные факты. Ничего не выдумывай: "
-       "не добавляй IP, домены, порты, числа и CVE, которых нет в цитируемых фактах. Каждый пункт обязан содержать cites — список id фактов (например [\"F1\",\"F3\"]). "
+       "не добавляй IP, домены, порты, числа и CVE, которых нет в цитируемых фактах. Описывай только наблюдаемое: не делай предположений о назначении, причинах и взломе (никаких \"может быть backdoor\"). Severity пункта не выше severity цитируемых фактов. Каждый пункт обязан содержать cites — список id фактов (например [\"F1\",\"F3\"]). "
        "Пиши по-русски, кратко. Ответ строго JSON: {\"summary\": str, \"items\": [{\"text\": str, \"severity\": \"critical|high|medium|low|info\", \"cites\": [str]}], "
        "\"next_steps\": [{\"text\": str, \"cites\": [str]}]}. summary — 1-2 предложения без новых чисел.")
 
@@ -35,7 +35,12 @@ def validate(data, facts):
         if not cites or not x.get("text"): return False
         src = " ".join(facts[k] for k in cites).lower()
         return all(m.lower() in src for m in ENT.findall(x["text"]))
-    items = [i for i in data.get("items", []) if ok(i) or not (dropped := dropped + 1)]
+    def cap(i):  # severity пункта не может быть выше, чем у цитируемых фактов
+        sev = [diff.ORDER[m.group(1)] for k in i["cites"] if k in facts and (m := re.match(r"\[(\w+)\]", facts[k])) and m.group(1) in diff.ORDER]
+        lim = min(sev) if sev else diff.ORDER["info"]
+        if diff.ORDER.get(i.get("severity", "info"), 4) < lim: i["severity"] = {v: k for k, v in diff.ORDER.items()}[lim]
+        return i
+    items = [cap(i) for i in data.get("items", []) if ok(i) or not (dropped := dropped + 1)]
     steps = [i for i in data.get("next_steps", []) if ok(i) or not (dropped := dropped + 1)]
     return items, steps, dropped
 

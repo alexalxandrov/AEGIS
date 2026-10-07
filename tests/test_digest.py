@@ -17,4 +17,10 @@ class T(unittest.TestCase):
         def bad(s, u): raise OSError()
         self.assertIn("LLM недоступна", digest.make(self.c, 1, 48, llm_fn=bad))
         self.assertIn("без LLM", digest.make(self.c, 1, 48, use_llm=False))
+
+class T2(unittest.TestCase):
+    def test_severity_cap(self):
+        f = {"F1": "[info] PORTS_SEEN: 1.2.3.4: порты [31337]"}
+        items, _, _ = digest.validate({"items": [{"text": "Порт 31337 на 1.2.3.4", "severity": "critical", "cites": ["F1"]}]}, f)
+        self.assertEqual(items[0]["severity"], "info")
 if __name__ == "__main__": unittest.main()
