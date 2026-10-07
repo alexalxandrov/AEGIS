@@ -1,8 +1,14 @@
 """Пассивное обогащение: RIPEstat (ASN), Shodan InternetDB, RDAP. Стоп-лист CDN/облаков."""
 import urllib.error
 from .ct import fetch_json
-CDN_ASNS = {13335, 209242, 132892, 394536, 20940, 16625, 54113, 16509, 14618, 15169, 396982, 8075, 19551, 30148, 60068, 20446}
-CDN_WORDS = ("cloudflare", "akamai", "fastly", "amazon", "google", "microsoft", "incapsula", "imperva", "cloudfront", "sucuri")
+# только чистые CDN/WAF-прокси. Хостинги/облака (Linode, AWS EC2, DO) сюда НЕ входят: там сервер клиента.
+CDN_ASNS = {13335, 209242, 132892, 394536, 20940, 16625, 54113, 19551, 30148, 60068, 20446}
+CDN_WORDS = ("cloudflare", "fastly", "cloudfront", "incapsula", "imperva", "sucuri")
+SLD = {"co", "com", "org", "net", "gov", "edu", "ac"}
+
+def registrable(name):
+    l = name.lower().rstrip(".").split(".")
+    return ".".join(l[-3:] if len(l) >= 3 and len(l[-1]) == 2 and l[-2] in SLD else l[-2:])
 
 def is_third_party(asn, holder):
     return int(asn) in CDN_ASNS or any(w in (holder or "").lower() for w in CDN_WORDS)
@@ -21,7 +27,10 @@ def ip_intel(ip):
     return out
 
 def domain_intel(name):
-    d = fetch_json(f"https://rdap.org/domain/{name}")
+    try: d = fetch_json(f"https://rdap.org/domain/{registrable(name)}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404: return [{"key": "rdap", "value": {}}]
+        raise
     ev = {e.get("eventAction"): e.get("eventDate") for e in d.get("events", [])}
     return [{"key": "rdap", "value": {"registered": ev.get("registration"), "expires": ev.get("expiration"),
              "status": sorted(d.get("status", [])), "ns": sorted(n.get("ldhName", "").lower() for n in d.get("nameservers", []))}}]

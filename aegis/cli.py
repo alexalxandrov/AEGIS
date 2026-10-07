@@ -59,6 +59,26 @@ def cmd_assets(a):
 def cmd_scope(a):
     c = db.connect(); scope.set_scope(c, a.asset_id, a.state); print("ok")
 
+def cmd_dns(a):
+    from .tentacles import dns
+    for t in ("A", "AAAA", "NS", "MX"):
+        r = dns.resolve(a.name, t); print(t, r["values"], "согласны" if r["agree"] else "РАСХОЖДЕНИЕ", r["per_resolver"])
+
+def cmd_diff(a):
+    import time
+    from . import diff
+    c = db.connect(); o = c.execute("SELECT id FROM organization WHERE name=?", (a.org,)).fetchone()
+    if not o: sys.exit("нет организации")
+    ev = diff.compute(c, o["id"], time.time() - a.hours * 3600)
+    new = diff.save(c, ev)
+    print(f"событий: {len(ev)}, новых findings: {len(new)}")
+    for e in sorted(ev, key=lambda e: diff.ORDER[e["severity"]]): print(f"[{e['severity']:<8}] {e['kind']:<16} {e['text']}")
+
+def cmd_findings(a):
+    c = db.connect()
+    for r in c.execute("SELECT f.id,f.severity,f.kind,f.state,a.value FROM finding f JOIN asset a ON a.id=f.asset_id ORDER BY f.id DESC LIMIT 50"):
+        print(f"#{r['id']} {r['severity']:<8} {r['kind']:<16} {r['state']:<6} {r['value']}")
+
 def main():
     p = argparse.ArgumentParser("aegis"); s = p.add_subparsers(dest="cmd", required=True)
     s.add_parser("init").set_defaults(f=cmd_init)
@@ -70,6 +90,9 @@ def main():
     x = s.add_parser("run"); x.add_argument("org"); x.add_argument("--limit", type=int, default=300); x.set_defaults(f=cmd_run)
     s.add_parser("assets").set_defaults(f=cmd_assets)
     x = s.add_parser("scope"); x.add_argument("asset_id", type=int); x.add_argument("state", choices=sorted(scope.STATES)); x.set_defaults(f=cmd_scope)
+    x = s.add_parser("dns"); x.add_argument("name"); x.set_defaults(f=cmd_dns)
+    x = s.add_parser("diff"); x.add_argument("org"); x.add_argument("--hours", type=float, default=24); x.set_defaults(f=cmd_diff)
+    s.add_parser("findings").set_defaults(f=cmd_findings)
     a = p.parse_args(); a.f(a)
 
 if __name__ == "__main__": main()

@@ -25,4 +25,10 @@ class T2(unittest.TestCase):
     def test_fallback_system(self):
         f=lambda n,t,r: None if r!="system" else ["5.5.5.5"]
         r=dns.resolve("x","A",["1.1.1.1","8.8.8.8"],f); self.assertEqual(r["values"],["5.5.5.5"])
+
+class T3(unittest.TestCase):
+    def test_registrable(self):
+        from aegis.tentacles.intel import registrable, is_third_party
+        self.assertEqual(registrable("scanme.nmap.org"), "nmap.org"); self.assertEqual(registrable("a.b.example.co.uk"), "example.co.uk")
+        self.assertFalse(is_third_party(63949, "AKAMAI-LINODE-AP Akamai Connected Cloud")); self.assertTrue(is_third_party(13335, ""))
 if __name__=="__main__": unittest.main()

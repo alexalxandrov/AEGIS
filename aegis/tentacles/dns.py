@@ -68,6 +68,6 @@ class DNS(Tentacle):
         out = []
         for t in self.types:
             r = resolve(asset["value"], t)
-            if r["values"]:
+            if r["values"] or r["agree"]:
                 out.append({"key": f"dns_{t}", "value": r["values"], "agree": r["agree"]})
         return out

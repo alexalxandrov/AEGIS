@@ -17,7 +17,7 @@ def run_org(c, org_name, log=print, ct_fn=None, dns_fn=None, limit=300, workers=
     for seed in seeds:
         try: items = (ct_fn or ct.CT().run)(c, seed)
         except Exception as e:
-            log(f"[ct] {seed['value']}: сбой {type(e).__name__}")
+            log(f"[ct] {seed['value']}: сбой {type(e).__name__} {getattr(e, 'code', '')}")
             c.execute("INSERT OR REPLACE INTO source_health VALUES('crt.sh',0,strftime('%s','now'),?)", (str(e)[:100],)); items = []
         items = sorted(items, key=lambda i: (i["asset_value"].count("."), i["asset_value"]))
         if len(items) > limit: log(f"[ct] {seed['value']}: {len(items)} имён, беру {limit} (--limit)")
@@ -62,7 +62,7 @@ def enrich(c, org, seed_ids, stats, log, ip_fn, dom_fn, workers):
     log(f"[intel] обогащаю {len(jobs)} активов")
     def work(j):
         try: return j[0], j[1](j[0]["value"]), None
-        except Exception as e: return j[0], [], f"{type(e).__name__}"
+        except Exception as e: return j[0], [], f"{type(e).__name__} {getattr(e, 'code', '')}"
     with ThreadPoolExecutor(min(workers, 4)) as ex:
         for a, items, err in ex.map(work, jobs):
             if err: log(f"[intel] {a['value']}: сбой {err}"); continue
@@ -73,6 +73,7 @@ def enrich(c, org, seed_ids, stats, log, ip_fn, dom_fn, workers):
                         nid, new = store.upsert_asset(c, org, "asn", f"AS{x['asn']}", existence=0.95, attribution=0.3); stats["assets_new"] += new
                         store.edge(c, a["id"], nid, "announced_by")
                         store.observe(c, nid, "intel", "holder", x["holder"])
+                        c.execute("UPDATE asset SET scope='THIRD_PARTY' WHERE id=? AND scope='CANDIDATE'", (nid,))  # сеть провайдера — не наша
                         if intel.is_third_party(x["asn"], x["holder"]):
-                            c.execute("UPDATE asset SET scope='THIRD_PARTY' WHERE id IN (?,?) AND scope='CANDIDATE'", (a["id"], nid))
+                            c.execute("UPDATE asset SET scope='THIRD_PARTY' WHERE id=? AND scope='CANDIDATE'", (a["id"],))
                             store.observe(c, a["id"], "intel", "third_party", f"AS{x['asn']} {x['holder']}")

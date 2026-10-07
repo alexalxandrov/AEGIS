@@ -37,6 +37,10 @@ class CT(Tentacle):
     name = "ct"
     def run(self, conn, asset):
         d = asset["value"]
-        rows = fetch_json("https://crt.sh/?q=" + urllib.parse.quote("%." + d) + "&output=json")
+        try:
+            rows = fetch_json("https://crt.sh/?q=" + urllib.parse.quote("%." + d) + "&output=json")
+        except Exception:  # crt.sh часто отдаёт 5xx — запасной источник CertSpotter
+            j = fetch_json(f"https://api.certspotter.com/v1/issuances?domain={d}&include_subdomains=true&expand=dns_names")
+            rows = [{"id": x.get("id"), "name_value": "\n".join(x.get("dns_names", []))} for x in j]
         return [{"asset_kind": "domain", "asset_value": n, "key": "ct_certs", "value": sorted(v["certs"])[:50]}
                 for n, v in names_from_rows(rows, d).items()]
