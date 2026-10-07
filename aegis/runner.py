@@ -3,11 +3,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from . import store
 import ipaddress
-from .tentacles import ct, dns, intel
+from .tentacles import ct, dns, intel, wayback, email as emailmod
+from . import wordlist
 
 RECHECK = 6 * 3600
 
-def run_org(c, org_name, log=print, ct_fn=None, dns_fn=None, limit=300, workers=16, ip_fn=None, dom_fn=None):
+def run_org(c, org_name, log=print, ct_fn=None, dns_fn=None, limit=300, workers=16, ip_fn=None, dom_fn=None, brute=False, wb=True):
     o = c.execute("SELECT id FROM organization WHERE name=?", (org_name,)).fetchone()
     if not o: raise SystemExit("нет организации")
     org = o["id"]; stats = {"assets_new": 0, "obs_new": 0, "obs_same": 0, "dns_checked": 0, "dns_left": 0}
@@ -26,6 +27,24 @@ def run_org(c, org_name, log=print, ct_fn=None, dns_fn=None, limit=300, workers=
             stats["assets_new"] += new
             if aid != seed["id"]: store.edge(c, seed["id"], aid, "has_subdomain")
             ch = store.observe(c, aid, "ct", it["key"], it["value"]); stats["obs_new" if ch else "obs_same"] += 1
+    if wb:
+        for seed in seeds:
+            try: wb_hosts = (ct_fn and None) or wayback.hosts(seed["value"])
+            except Exception as e: log(f"[wayback] {seed['value']}: сбой {type(e).__name__}"); wb_hosts = set()
+            for n in wb_hosts:
+                aid, new = store.upsert_asset(c, org, "domain", n, existence=0.5, attribution=0.4); stats["assets_new"] += new
+                if aid != seed["id"]: store.edge(c, seed["id"], aid, "has_subdomain")
+                ch = store.observe(c, aid, "wayback", "seen", True); stats["obs_new" if ch else "obs_same"] += 1
+    if brute:
+        for seed in seeds:
+            cands = [f"{w}.{seed['value']}" for w in wordlist.WORDS]
+            found = 0
+            with ThreadPoolExecutor(workers) as ex:
+                for name, r in zip(cands, ex.map(lambda n: dns.resolve(n, "A"), cands)):
+                    if r["values"]:
+                        aid, new = store.upsert_asset(c, org, "domain", name, existence=0.7, attribution=0.5); stats["assets_new"] += new; found += 1
+                        store.edge(c, seed["id"], aid, "has_subdomain"); store.observe(c, aid, "brute", "dns_A", r["values"])
+            log(f"[brute] {seed['value']}: словарь {len(wordlist.WORDS)} слов, найдено {found}")
     cutoff = time.time() - RECHECK
     todo = [a for a in c.execute("SELECT * FROM asset WHERE org_id=? AND kind='domain' ORDER BY id", (org,)).fetchall()
             if not c.execute("SELECT 1 FROM observation WHERE asset_id=? AND source='dns' AND last_confirmed>?", (a["id"], cutoff)).fetchone()
@@ -47,6 +66,12 @@ def run_org(c, org_name, log=print, ct_fn=None, dns_fn=None, limit=300, workers=
                     for ip in it["value"]:
                         ipid, new = store.upsert_asset(c, org, "ip", ip, existence=0.9, attribution=0.5); stats["assets_new"] += new
                         store.edge(c, a["id"], ipid, "resolves_to")
+    for seed in seeds:
+        try:
+            e = emailmod.check(seed["value"])
+            for k, v in (("spf", e["spf"]), ("dmarc", e["dmarc"]), ("dkim", e["dkim"])):
+                ch = store.observe(c, seed["id"], "email", k, v, allow_empty=True); stats["obs_new" if ch else "obs_same"] += 1
+        except Exception as ex: log(f"[email] {seed['value']}: сбой {type(ex).__name__}")
     enrich(c, org, seed_ids, stats, log, ip_fn or intel.ip_intel, dom_fn or intel.domain_intel, workers)
     log(f"готово: {stats}" + (" — запустите run ещё раз для остатка" if stats["dns_left"] else "")); return stats
 

@@ -46,8 +46,13 @@ def classify(asset, key, old, new):
     return None
 
 def static_checks(c, org_id):
-    """Не требует истории: срок домена."""
+    """Не требует истории: срок домена, email-защита."""
     out = []
+    for r in c.execute("SELECT a.id,a.value FROM asset a JOIN seed s ON s.org_id=a.org_id AND s.value=a.value WHERE a.org_id=?", (org_id,)):
+        spf = c.execute("SELECT value FROM observation WHERE asset_id=? AND key='spf' ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
+        dmarc = c.execute("SELECT value FROM observation WHERE asset_id=? AND key='dmarc' ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
+        if spf and _j(spf["value"]) is None: out.append({"asset_id": r["id"], "kind": "NO_SPF", "severity": "medium", "text": f"{r['value']}: нет SPF-записи", "obs": []})
+        if dmarc and _j(dmarc["value"]) is None: out.append({"asset_id": r["id"], "kind": "NO_DMARC", "severity": "medium", "text": f"{r['value']}: нет DMARC-записи (возможен спуфинг писем)", "obs": []})
     for r in c.execute("SELECT a.id,a.value,o.value v FROM asset a JOIN observation o ON o.asset_id=a.id AND o.key='rdap' "
                        "WHERE a.org_id=? AND o.id=(SELECT MAX(id) FROM observation WHERE asset_id=a.id AND key='rdap')", (org_id,)):
         v = _j(r["v"]); d = _days_left(v.get("expires")) if isinstance(v, dict) else None
@@ -85,9 +90,25 @@ def save(c, events):
     new = []
     for e in events:
         key = json.dumps(e["obs"])
-        if c.execute("SELECT 1 FROM finding WHERE asset_id=? AND kind=? AND obs_ids=? AND state='open'", (e["asset_id"], e["kind"], key)).fetchone(): continue
-        c.execute("INSERT INTO finding(asset_id,kind,severity,state,obs_ids,created) VALUES(?,?,?,?,?,?)",
-                  (e["asset_id"], e["kind"], e["severity"], "open", key, time.time())); new.append(e)
+        if c.execute("SELECT 1 FROM finding WHERE asset_id=? AND kind=? AND obs_ids=?", (e["asset_id"], e["kind"], key)).fetchone(): continue
+        c.execute("INSERT INTO finding(asset_id,kind,severity,state,obs_ids,created,text) VALUES(?,?,?,?,?,?,?)",
+                  (e["asset_id"], e["kind"], e["severity"], "open", key, time.time(), e["text"])); new.append(e)
     return new
+
+def visible(c, events):
+    """Скрывает события, уже принятые (accepted) или попавшие в baseline."""
+    return [e for e in events if not c.execute("SELECT 1 FROM finding WHERE asset_id=? AND kind=? AND obs_ids=? AND state IN ('baseline','accepted')",
+            (e["asset_id"], e["kind"], json.dumps(e["obs"]))).fetchone()]
+
+WEIGHT = {"critical": 40, "high": 20, "medium": 8, "low": 3, "info": 0}
+
+def risk(c, org_id):
+    """Риск по активам: сумма весов открытых findings (кроме THIRD_PARTY/OUT_OF_SCOPE), максимум 100. Итог орг. = сумма 5 худших, максимум 100."""
+    rows = c.execute("SELECT a.value,f.severity FROM finding f JOIN asset a ON a.id=f.asset_id WHERE a.org_id=? AND f.state='open' "
+                     "AND a.scope NOT IN ('THIRD_PARTY','OUT_OF_SCOPE')", (org_id,)).fetchall()
+    per = {}
+    for r in rows: per[r["value"]] = min(100, per.get(r["value"], 0) + WEIGHT[r["severity"]])
+    top = sorted(per.items(), key=lambda x: -x[1])
+    return min(100, sum(v for _, v in top[:5])), top
 
 ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}

@@ -49,7 +49,7 @@ def cmd_check(a):
 
 def cmd_run(a):
     from . import runner
-    runner.run_org(db.connect(), a.org, limit=a.limit)
+    runner.run_org(db.connect(), a.org, limit=a.limit, brute=a.brute, wb=not a.no_wayback)
 
 def cmd_assets(a):
     c = db.connect()
@@ -70,14 +70,14 @@ def cmd_diff(a):
     c = db.connect(); o = c.execute("SELECT id FROM organization WHERE name=?", (a.org,)).fetchone()
     if not o: sys.exit("нет организации")
     ev = diff.compute(c, o["id"], time.time() - a.hours * 3600)
-    new = diff.save(c, ev)
+    new = diff.save(c, ev); ev = diff.visible(c, ev)
     print(f"событий: {len(ev)}, новых findings: {len(new)}")
     for e in sorted(ev, key=lambda e: diff.ORDER[e["severity"]]): print(f"[{e['severity']:<8}] {e['kind']:<16} {e['text']}")
 
 def cmd_findings(a):
     c = db.connect()
-    for r in c.execute("SELECT f.id,f.severity,f.kind,f.state,a.value FROM finding f JOIN asset a ON a.id=f.asset_id ORDER BY f.id DESC LIMIT 50"):
-        print(f"#{r['id']} {r['severity']:<8} {r['kind']:<16} {r['state']:<6} {r['value']}")
+    q = "SELECT f.id,f.severity,f.kind,f.state,f.text,a.value FROM finding f JOIN asset a ON a.id=f.asset_id " + ("" if a.all else "WHERE f.state='open' ") + "ORDER BY f.id DESC LIMIT 100"
+    for r in c.execute(q): print(f"#{r['id']} {r['severity']:<8} {r['kind']:<18} {r['state']:<8} {r['text'] or r['value']}")
 
 def cmd_web(a):
     from . import runner
@@ -91,18 +91,18 @@ def cmd_digest(a):
     import datetime
     f = config.DATA_DIR / f"digest_{a.org}_{datetime.date.today()}.md"; f.write_text(md); print(md); print("\nсохранено:", f)
 
-def do_scan(org, hours=48, use_llm=True, limit=300):
+def do_scan(org, hours=48, use_llm=True, limit=300, brute=False):
     import time, datetime
     from . import runner, diff, digest
     c = db.connect()
-    runner.run_org(c, org, limit=limit); runner.probe_org(c, org)
+    runner.run_org(c, org, limit=limit, brute=brute); runner.probe_org(c, org)
     o = c.execute("SELECT id FROM organization WHERE name=?", (org,)).fetchone()
     new = diff.save(c, diff.compute(c, o["id"], time.time() - hours * 3600))
     print(f"[scan] новых findings: {len(new)}")
     md = digest.make(c, o["id"], hours, use_llm=use_llm)
     f = config.DATA_DIR / f"digest_{org}_{datetime.date.today()}.md"; f.write_text(md); print("[scan] дайджест:", f)
 
-def cmd_scan(a): do_scan(a.org, a.hours, not a.no_llm, a.limit)
+def cmd_scan(a): do_scan(a.org, a.hours, not a.no_llm, a.limit, a.brute)
 
 def cmd_watch(a):
     import time
@@ -113,6 +113,25 @@ def cmd_watch(a):
         try: time.sleep(a.every * 3600)
         except KeyboardInterrupt: print("\n[watch] стоп"); return
 
+def cmd_baseline(a):
+    from . import diff
+    c = db.connect(); o = c.execute("SELECT id FROM organization WHERE name=?", (a.org,)).fetchone()
+    if not o: sys.exit("нет организации")
+    diff.save(c, diff.compute(c, o["id"], 0))
+    n = c.execute("UPDATE finding SET state='baseline' WHERE state='open' AND asset_id IN (SELECT id FROM asset WHERE org_id=?)", (o["id"],)).rowcount
+    print(f"baseline зафиксирован: {n} findings; дальше показываются только изменения")
+
+def cmd_accept(a):
+    c = db.connect(); n = c.execute("UPDATE finding SET state='accepted',note=? WHERE id=?", (a.note, a.id)).rowcount
+    print("принято" if n else "нет такого id")
+
+def cmd_risk(a):
+    from . import diff
+    c = db.connect(); o = c.execute("SELECT id FROM organization WHERE name=?", (a.org,)).fetchone()
+    if not o: sys.exit("нет организации")
+    total, top = diff.risk(c, o["id"]); print(f"Риск организации: {total}/100")
+    for v, s in top[:10]: print(f"  {s:>3}  {v}")
+
 def main():
     p = argparse.ArgumentParser("aegis"); s = p.add_subparsers(dest="cmd", required=True)
     s.add_parser("init").set_defaults(f=cmd_init)
@@ -121,15 +140,18 @@ def main():
     x = s.add_parser("seed"); x.add_argument("org"); x.add_argument("kind", choices=["domain", "asn", "cidr"]); x.add_argument("value")
     x.add_argument("--verified", action="store_true"); x.set_defaults(f=cmd_seed)
     x = s.add_parser("probe"); x.add_argument("asset_id", type=int); x.set_defaults(f=cmd_probe)
-    x = s.add_parser("run"); x.add_argument("org"); x.add_argument("--limit", type=int, default=300); x.set_defaults(f=cmd_run)
+    x = s.add_parser("run"); x.add_argument("org"); x.add_argument("--limit", type=int, default=300); x.add_argument("--brute", action="store_true"); x.add_argument("--no-wayback", action="store_true"); x.set_defaults(f=cmd_run)
     s.add_parser("assets").set_defaults(f=cmd_assets)
     x = s.add_parser("scope"); x.add_argument("asset_id", type=int); x.add_argument("state", choices=sorted(scope.STATES)); x.set_defaults(f=cmd_scope)
     x = s.add_parser("dns"); x.add_argument("name"); x.set_defaults(f=cmd_dns)
     x = s.add_parser("diff"); x.add_argument("org"); x.add_argument("--hours", type=float, default=24); x.set_defaults(f=cmd_diff)
-    s.add_parser("findings").set_defaults(f=cmd_findings)
+    x = s.add_parser("findings"); x.add_argument("--all", action="store_true"); x.set_defaults(f=cmd_findings)
+    x = s.add_parser("baseline"); x.add_argument("org"); x.set_defaults(f=cmd_baseline)
+    x = s.add_parser("accept"); x.add_argument("id", type=int); x.add_argument("--note", default=""); x.set_defaults(f=cmd_accept)
+    x = s.add_parser("risk"); x.add_argument("org"); x.set_defaults(f=cmd_risk)
     x = s.add_parser("web"); x.add_argument("org"); x.set_defaults(f=cmd_web)
     x = s.add_parser("digest"); x.add_argument("org"); x.add_argument("--hours", type=float, default=48); x.add_argument("--no-llm", action="store_true"); x.set_defaults(f=cmd_digest)
-    x = s.add_parser("scan"); x.add_argument("org"); x.add_argument("--hours", type=float, default=48); x.add_argument("--limit", type=int, default=300); x.add_argument("--no-llm", action="store_true"); x.set_defaults(f=cmd_scan)
+    x = s.add_parser("scan"); x.add_argument("org"); x.add_argument("--hours", type=float, default=48); x.add_argument("--limit", type=int, default=300); x.add_argument("--no-llm", action="store_true"); x.add_argument("--brute", action="store_true"); x.set_defaults(f=cmd_scan)
     x = s.add_parser("watch"); x.add_argument("org"); x.add_argument("--every", type=float, default=6); x.add_argument("--no-llm", action="store_true"); x.set_defaults(f=cmd_watch)
     a = p.parse_args(); a.f(a)
 

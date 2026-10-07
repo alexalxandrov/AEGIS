@@ -21,7 +21,7 @@ def snapshot(c, org_id, cap=30):
     return out
 
 def build_facts(c, org_id, hours):
-    ev = sorted(diff.compute(c, org_id, time.time() - hours * 3600), key=lambda e: diff.ORDER[e["severity"]])
+    ev = sorted(diff.visible(c, diff.compute(c, org_id, time.time() - hours * 3600)), key=lambda e: diff.ORDER[e["severity"]])
     facts = [f"[{e['severity']}] {e['kind']}: {e['text']}" for e in ev[:50]] + snapshot(c, org_id)
     return {f"F{i}": t for i, t in enumerate(facts, 1)}
 

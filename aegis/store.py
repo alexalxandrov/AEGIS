@@ -15,11 +15,11 @@ def upsert_asset(c, org_id, kind, value, existence=0.0, attribution=0.0, scope="
                     (org_id, kind, value, scope, existence, attribution, t, t))
     return cur.lastrowid, True
 
-def observe(c, asset_id, source, key, value):
+def observe(c, asset_id, source, key, value, allow_empty=False):
     """Возвращает True, если значение изменилось/новое (создана новая запись)."""
     v = json.dumps(value, sort_keys=True, ensure_ascii=False)
     prior = c.execute("SELECT 1 FROM observation WHERE asset_id=? AND source=? AND key=? LIMIT 1", (asset_id, source, key)).fetchone()
-    if not prior and value in ([], {}, None, ""): return False  # пустое без истории — не пишем
+    if not allow_empty and not prior and value in ([], {}, None, ""): return False  # пустое без истории — не пишем
     h = hashlib.sha256(v.encode()).hexdigest()[:16]
     t = now()
     last = c.execute("SELECT id,evidence_hash FROM observation WHERE asset_id=? AND source=? AND key=? ORDER BY id DESC LIMIT 1",

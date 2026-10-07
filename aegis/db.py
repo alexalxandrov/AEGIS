@@ -30,6 +30,8 @@ def connect(path=None):
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL"); c.execute("PRAGMA foreign_keys=ON")
     c.executescript(SCHEMA)
+    if "text" not in [r[1] for r in c.execute("PRAGMA table_info(finding)")]:
+        c.execute("ALTER TABLE finding ADD COLUMN text TEXT"); c.execute("ALTER TABLE finding ADD COLUMN note TEXT")
     return c
 
 def enqueue(c, kind, payload=None, run_after=0):
