@@ -27,14 +27,21 @@ def run_org(c, org_name, log=print, ct_fn=None, dns_fn=None, limit=300, workers=
             stats["assets_new"] += new
             if aid != seed["id"]: store.edge(c, seed["id"], aid, "has_subdomain")
             ch = store.observe(c, aid, "ct", it["key"], it["value"]); stats["obs_new" if ch else "obs_same"] += 1
-    if wb:
+    if wb and ct_fn is None:
+        # live Wayback only when not in injected-collector test mode
         for seed in seeds:
-            try: wb_hosts = (ct_fn and None) or wayback.hosts(seed["value"])
-            except Exception as e: log(f"[wayback] {seed['value']}: сбой {type(e).__name__}"); wb_hosts = set()
+            try:
+                wb_hosts = wayback.hosts(seed["value"])
+            except Exception as e:
+                log(f"[wayback] {seed['value']}: сбой {type(e).__name__}")
+                wb_hosts = set()
             for n in wb_hosts:
-                aid, new = store.upsert_asset(c, org, "domain", n, existence=0.5, attribution=0.4); stats["assets_new"] += new
-                if aid != seed["id"]: store.edge(c, seed["id"], aid, "has_subdomain")
-                ch = store.observe(c, aid, "wayback", "seen", True); stats["obs_new" if ch else "obs_same"] += 1
+                aid, new = store.upsert_asset(c, org, "domain", n, existence=0.5, attribution=0.4)
+                stats["assets_new"] += new
+                if aid != seed["id"]:
+                    store.edge(c, seed["id"], aid, "has_subdomain")
+                ch = store.observe(c, aid, "wayback", "seen", True)
+                stats["obs_new" if ch else "obs_same"] += 1
     if brute:
         for seed in seeds:
             cands = [f"{w}.{seed['value']}" for w in wordlist.WORDS]
@@ -66,12 +73,15 @@ def run_org(c, org_name, log=print, ct_fn=None, dns_fn=None, limit=300, workers=
                     for ip in it["value"]:
                         ipid, new = store.upsert_asset(c, org, "ip", ip, existence=0.9, attribution=0.5); stats["assets_new"] += new
                         store.edge(c, a["id"], ipid, "resolves_to")
-    for seed in seeds:
-        try:
-            e = emailmod.check(seed["value"])
-            for k, v in (("spf", e["spf"]), ("dmarc", e["dmarc"]), ("dkim", e["dkim"])):
-                ch = store.observe(c, seed["id"], "email", k, v, allow_empty=True); stats["obs_new" if ch else "obs_same"] += 1
-        except Exception as ex: log(f"[email] {seed['value']}: сбой {type(ex).__name__}")
+    if dns_fn is None:
+        for seed in seeds:
+            try:
+                e = emailmod.check(seed["value"])
+                for k, v in (("spf", e["spf"]), ("dmarc", e["dmarc"]), ("dkim", e["dkim"])):
+                    ch = store.observe(c, seed["id"], "email", k, v, allow_empty=True)
+                    stats["obs_new" if ch else "obs_same"] += 1
+            except Exception as ex:
+                log(f"[email] {seed['value']}: сбой {type(ex).__name__}")
     enrich(c, org, seed_ids, stats, log, ip_fn or intel.ip_intel, dom_fn or intel.domain_intel, workers)
     log(f"готово: {stats}" + (" — запустите run ещё раз для остатка" if stats["dns_left"] else "")); return stats
 

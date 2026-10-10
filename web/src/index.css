@@ -1,0 +1,65 @@
+@import "@fontsource/ibm-plex-sans/400.css";
+@import "@fontsource/ibm-plex-sans/500.css";
+@import "@fontsource/ibm-plex-sans/600.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #f4f6f7;
+  --bg-panel: #ffffff;
+  --bg-elevated: #eef1f3;
+  --border: #d4dbe0;
+  --text: #1a2228;
+  --text-muted: #5c6b75;
+  --accent: #2a9d92;
+  --accent-hover: #238a80;
+}
+
+.dark {
+  --bg: #0f1214;
+  --bg-panel: #151a1d;
+  --bg-elevated: #1a1f22;
+  --border: #2a3238;
+  --text: #e8eef0;
+  --text-muted: #8a9aa6;
+  --accent: #3dbeb0;
+  --accent-hover: #35a89c;
+}
+
+@layer base {
+  html {
+    @apply antialiased;
+  }
+  body {
+    @apply bg-[var(--bg)] text-[var(--text)] font-sans min-h-screen;
+  }
+  *:focus-visible {
+    @apply outline-none ring-2 ring-accent ring-offset-2 ring-offset-[var(--bg)];
+  }
+}
+
+@layer components {
+  .panel {
+    @apply bg-[var(--bg-panel)] border border-[var(--border)] rounded-lg;
+  }
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium
+      bg-accent text-graphite dark:text-graphite hover:bg-accent-hover transition-colors
+      disabled:opacity-50 disabled:pointer-events-none;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 px-3 py-1.5 rounded-md text-sm
+      border border-[var(--border)] hover:bg-[var(--bg-elevated)] transition-colors
+      disabled:opacity-50;
+  }
+  .input {
+    @apply w-full px-3 py-1.5 rounded-md text-sm bg-[var(--bg-elevated)] border border-[var(--border)]
+      placeholder:text-[var(--text-muted)] focus:border-accent;
+  }
+  .label {
+    @apply text-xs font-medium uppercase tracking-wide text-[var(--text-muted)];
+  }
+}

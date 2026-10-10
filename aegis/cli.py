@@ -80,8 +80,26 @@ def cmd_findings(a):
     for r in c.execute(q): print(f"#{r['id']} {r['severity']:<8} {r['kind']:<18} {r['state']:<8} {r['text'] or r['value']}")
 
 def cmd_web(a):
+    """Активные HTTP/TLS-пробы (не веб-интерфейс). Для UI: aegis serve."""
     from . import runner
     runner.probe_org(db.connect(), a.org)
+
+def cmd_serve(a):
+    """Локальный веб-интерфейс + API на 127.0.0.1 (без docker)."""
+    try:
+        import uvicorn
+    except ImportError:
+        sys.exit("нужен uvicorn: pip install -r requirements.txt")
+    from .api import create_app
+    from . import jobs, sources
+    c = db.connect()
+    jobs.mark_stale_on_boot(c)
+    sources.ensure_registry(c)
+    host = a.host or config.BIND_HOST
+    port = a.port or config.BIND_PORT
+    print(f"AEGIS UI: http://{host}:{port}")
+    print(f"API docs: http://{host}:{port}/api/docs")
+    uvicorn.run(create_app(), host=host, port=port, log_level="info")
 
 def cmd_digest(a):
     from . import digest
@@ -150,6 +168,7 @@ def main():
     x = s.add_parser("accept"); x.add_argument("id", type=int); x.add_argument("--note", default=""); x.set_defaults(f=cmd_accept)
     x = s.add_parser("risk"); x.add_argument("org"); x.set_defaults(f=cmd_risk)
     x = s.add_parser("web"); x.add_argument("org"); x.set_defaults(f=cmd_web)
+    x = s.add_parser("serve"); x.add_argument("--host", default=None); x.add_argument("--port", type=int, default=None); x.set_defaults(f=cmd_serve)
     x = s.add_parser("digest"); x.add_argument("org"); x.add_argument("--hours", type=float, default=48); x.add_argument("--no-llm", action="store_true"); x.set_defaults(f=cmd_digest)
     x = s.add_parser("scan"); x.add_argument("org"); x.add_argument("--hours", type=float, default=48); x.add_argument("--limit", type=int, default=300); x.add_argument("--no-llm", action="store_true"); x.add_argument("--brute", action="store_true"); x.set_defaults(f=cmd_scan)
     x = s.add_parser("watch"); x.add_argument("org"); x.add_argument("--every", type=float, default=6); x.add_argument("--no-llm", action="store_true"); x.set_defaults(f=cmd_watch)
