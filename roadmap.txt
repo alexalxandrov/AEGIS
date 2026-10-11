@@ -11,8 +11,8 @@
 
 ## PHASE 0 — Фундамент и проверка реальности (1–2 недели)
 
-- [ ] Репозиторий, `docker compose` (app + postgres + ollama), конфиг, логирование
-- [ ] **Проверка LLM на вашем железе:** какая модель запускается, скорость, качество на тестовом finding
+14 | - [ ] Репозиторий, `python -m aegis init` + конфиг, логирование
+15 | - [ ] **Проверка LLM на вашем железе:** какая модель запускается, скорость, качество на тестовом finding
 - [ ] БД: `Organization`, `Seed`, `Asset`, `Observation`, `Edge`, `Finding`, `Task`, `SourceHealth`
 - [ ] Очередь задач на Postgres (`SKIP LOCKED`) + планировщик
 - [ ] **Scope-ядро:** статусы `VERIFIED/CANDIDATE/THIRD_PARTY/OUT_OF_SCOPE`, отказ запуска active-щупальца вне `VERIFIED`, журнал действий

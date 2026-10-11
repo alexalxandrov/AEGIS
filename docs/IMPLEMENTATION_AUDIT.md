@@ -32,9 +32,9 @@ Backup: `backups/aegis.db.*` (existing `data/aegis.db` preserved)
 5. **Collector contract thin** — no readiness, rate limits, mode metadata, graceful registry.
 6. **No ProjectDiscovery adapters** — subfinder/dnsx/httpx/etc. absent.
 7. **No exclusions / depth limits** as first-class config.
-8. **Docker mentioned in roadmap Phase 0** — product decision: **no Docker**; local Python + SQLite.
-9. **README still says Postgres** for $0/self-hosted principle — SQLite is the default runtime.
-10. **No frontend build/serve path**.
+34 | 7. **Docker mentioned in roadmap Phase 0** — product decision: **no Docker**; local Python + SQLite.
+35 | 9. **README still says Postgres** for $0/self-hosted principle — SQLite is the default runtime.
+36 | 10. **No frontend build/serve path**.
 
 ## Decisions
 

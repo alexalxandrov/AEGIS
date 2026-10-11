@@ -315,8 +315,8 @@ API/UI:      FastAPI (+ HTMX или статический SPA)
 Планировщик: APScheduler внутри процесса
 LLM:         Ollama (локально)
 Доказательства: файловая система (сжатие, SHA-256)
-Деплой:      docker compose (app + postgres + ollama)
-```
+318 | Деплой:      none
+319 | ```
 
 ```
 aegis/

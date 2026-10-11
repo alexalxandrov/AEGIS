@@ -51,8 +51,11 @@ def static_checks(c, org_id):
     for r in c.execute("SELECT a.id,a.value FROM asset a JOIN seed s ON s.org_id=a.org_id AND s.value=a.value WHERE a.org_id=?", (org_id,)):
         spf = c.execute("SELECT value FROM observation WHERE asset_id=? AND key='spf' ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
         dmarc = c.execute("SELECT value FROM observation WHERE asset_id=? AND key='dmarc' ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
-        if spf and _j(spf["value"]) is None: out.append({"asset_id": r["id"], "kind": "NO_SPF", "severity": "medium", "text": f"{r['value']}: нет SPF-записи", "obs": []})
-        if dmarc and _j(dmarc["value"]) is None: out.append({"asset_id": r["id"], "kind": "NO_DMARC", "severity": "medium", "text": f"{r['value']}: нет DMARC-записи (возможен спуфинг писем)", "obs": []})
+        # SPF/DMARC are considered missing when there is no observation or the stored value cannot be parsed.
+        if spf is None or _j(spf["value"]) is None:
+            out.append({"asset_id": r["id"], "kind": "NO_SPF", "severity": "medium", "text": f"{r['value']}: нет SPF-записи", "obs": []})
+        if dmarc is None or _j(dmarc["value"]) is None:
+            out.append({"asset_id": r["id"], "kind": "NO_DMARC", "severity": "medium", "text": f"{r['value']}: нет DMARC-записи (возможен спуфинг писем)", "obs": []})
     for r in c.execute("SELECT a.id,a.value,o.value v FROM asset a JOIN observation o ON o.asset_id=a.id AND o.key='rdap' "
                        "WHERE a.org_id=? AND o.id=(SELECT MAX(id) FROM observation WHERE asset_id=a.id AND key='rdap')", (org_id,)):
         v = _j(r["v"]); d = _days_left(v.get("expires")) if isinstance(v, dict) else None

@@ -27,7 +27,8 @@ def run_org(c, org_name, log=print, ct_fn=None, dns_fn=None, limit=300, workers=
             stats["assets_new"] += new
             if aid != seed["id"]: store.edge(c, seed["id"], aid, "has_subdomain")
             ch = store.observe(c, aid, "ct", it["key"], it["value"]); stats["obs_new" if ch else "obs_same"] += 1
-    if wb and ct_fn is None:
+    # Run Wayback even if a custom CT collector is provided (used in tests).
+    if wb:
         # live Wayback only when not in injected-collector test mode
         for seed in seeds:
             try:
