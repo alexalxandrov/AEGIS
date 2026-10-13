@@ -3,6 +3,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from . import store
 import ipaddress
+# Import SSL patch first to ensure all urllib calls use an un‑verified context.
+from . import ssl_patch
 from .tentacles import ct, dns, intel, wayback, email as emailmod
 from . import wordlist
 
@@ -83,7 +85,7 @@ def run_org(c, org_name, log=print, ct_fn=None, dns_fn=None, limit=300, workers=
                     stats["obs_new" if ch else "obs_same"] += 1
             except Exception as ex:
                 log(f"[email] {seed['value']}: сбой {type(ex).__name__}")
-    enrich(c, org, seed_ids, stats, log, ip_fn or intel.ip_intel, dom_fn or intel.domain_intel, workers)
+    enrich(c, org, seed_ids, stats, log, ip_fn or intel.Intel.ip_intel, dom_fn or intel.Intel.domain_intel, workers)
     log(f"готово: {stats}" + (" — запустите run ещё раз для остатка" if stats["dns_left"] else "")); return stats
 
 

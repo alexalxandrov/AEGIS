@@ -154,6 +154,17 @@ def migrate(c):
             pass  # table may not exist yet on first boot before SCHEMA
 
 
+def create_tables(c):
+    """Create the initial database schema.
+
+    The schema is defined in the :data:`SCHEMA` constant and is executed with
+    :meth:`sqlite3.Connection.executescript`.  This function exists primarily to
+    aid unit tests which may wish to reset a connection without performing
+    migrations.  It is called by :func:`connect` during normal operation.
+    """
+    c.executescript(SCHEMA)
+
+
 def connect(path=None):
     p = path or config.DB_PATH
     if p != ":memory:":
@@ -162,7 +173,9 @@ def connect(path=None):
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA foreign_keys=ON")
-    c.executescript(SCHEMA)
+    # Separate schema creation for easier unit testing and potential future use.
+    # Separate schema creation for easier unit testing and potential future use.
+    create_tables(c)
     migrate(c)
     return c
 

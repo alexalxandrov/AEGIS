@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+import argparse
 
 from aegis import config, db, sources, ai_analyst
 
@@ -92,22 +93,81 @@ def _ensure_organization(c, name: str) -> int:
 
 
 def main() -> None:
+    """Parse command‑line arguments, perform sanity checks and launch a short
+    analysis pipeline.
+
+    The CLI accepts the same information that was previously collected via
+    ``input()``.  All parameters are optional; when omitted the interactive
+    prompts will be used.  For CI scenarios you can invoke the script with
+    ``--org <name> [--site <site>] [--ip <ip>] [--url <url>] [--nick <nick>]``.
+    """
+    parser = argparse.ArgumentParser(description="Bootstrap AEGIS for a single org")
+    parser.add_argument("--org", help="Organization name (will be created if not exists)")
+    parser.add_argument("--site", help="Hostname or domain")
+    parser.add_argument("--ip", help="IP address")
+    parser.add_argument("--url", help="URL of the target")
+    parser.add_argument("--nick", help="Nickname for the target")
+    parser.add_argument("--company", help="Company name")
+    parser.add_argument("--limit", type=int, default=300, help="Limit number of assets to scan")
+    parser.add_argument("--no-wayback", action="store_true", help="Skip Wayback probing")
+    args = parser.parse_args()
+
     _ensure_database()
     c = db.connect()
     _ensure_sources(c)
     _print_ollama_status()
 
-    org_name = input("Organization name (will be created if not exists): ").strip()
-    org_id = _ensure_organization(c, org_name) if org_name else None
-    if org_id:
-        print(f"Organization '{org_name}' has id {org_id}\n")
+    # Determine organization name – interactive fallback if not supplied.
+    org_name = args.org or input("Organization name (will be created if not exists): ").strip()
+    if not org_name:
+        print("No organization provided; skipping database entry.")
+        org_id = None
     else:
-        print("No organization provided; skipping database entry.\n")
+        org_id = _ensure_organization(c, org_name)
+        print(f"Organization '{org_name}' has id {org_id}\n")
 
-    info = _prompt_user()
+    # Collect target data.
+    info = {
+        "site": args.site or input("  Site (hostname or domain): ").strip(),
+        "ip": args.ip or input("  IP address: ").strip(),
+        "url": args.url or input("  URL: ").strip(),
+        "nick": args.nick or input("  Nickname: ").strip(),
+        "company": args.company or input("  Company name: ").strip(),
+    }
     print("\nCollected information:")
     for k, v in info.items():
         print(f"  {k:12s}: {v}")
+
+    # Insert seed data if the org exists.
+    if org_id:
+        # Seed domain asset.
+        c.execute(
+            "INSERT OR IGNORE INTO seed(org_id,kind,value,verified) VALUES(?,?,?,?)",
+            (org_id, "domain", info["site"], 1),
+        )
+        c.execute(
+            "INSERT OR IGNORE INTO asset(org_id,kind,value,scope,first_seen,last_seen) VALUES(?,?,?,?,strftime('%s','now'),strftime('%s','now'))",
+            (org_id, "domain", info["site"], "verified",),
+        )
+        # No explicit commit; ``sqlite3`` is in autocommit mode.
+
+    # Run a lightweight scan.
+    try:
+        from aegis import runner
+        print("\nRunning initial scan (may take a few seconds)...")
+        runner.run_org(c, org_name, limit=args.limit, brute=False, wb=not args.no_wayback)
+    except Exception as e:
+        print("Error during scan:", e)
+
+    # Demo AI ask – only if LLM is available.
+    status = ai_analyst.ollama_status()
+    if status.get("available") and status.get("preferred_present"):
+        print("\nAsking AI for a quick summary...")
+        answer = ai_analyst.ask(c, org_id, "Summarize findings for this organization.")
+        print("AI answer:", answer.get("answer"))
+    else:
+        print("Ollama not available; skipping AI ask.")
+
     print("\nDone.")
 
 

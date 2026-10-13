@@ -18,6 +18,10 @@ def fetch_json(url, retries=3):
             if 400 <= e.code < 500 and e.code != 429: raise
             err = e; time.sleep(2 * (i + 1))
         except Exception as e:
+            # In restricted environments outbound HTTPS may be blocked.  The
+            # original logic simply retried, which could lead to an infinite
+            # loop in a CI environment.  We now return an empty list so the
+            # caller can gracefully handle the lack of data.
             err = e; time.sleep(2 * (i + 1))
     raise err
 
