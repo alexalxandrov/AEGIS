@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+import datetime
+import sys
+import os
 import argparse
 
 from aegis import config, db, sources, ai_analyst
@@ -110,8 +113,42 @@ def main() -> None:
     parser.add_argument("--company", help="Company name")
     parser.add_argument("--limit", type=int, default=300, help="Limit number of assets to scan")
     parser.add_argument("--no-wayback", action="store_true", help="Skip Wayback probing")
+    parser.add_argument("--output-dir", help="Optional explicit output directory for this run")
     args = parser.parse_args()
 
+    # ----- Create a per‑run workspace -------------------------------------
+    # ``starter.py`` is the single entry point that is executed when a user
+    # starts a new scan.  We create a dedicated sub‑folder inside the directory
+    # that contains ``starter.py``.  The folder name contains the target
+    # site/domain and a UTC timestamp so that runs never collide and the
+    # artefacts are automatically archived.
+    if args.output_dir:
+        workspace = Path(args.output_dir).expanduser().resolve()
+    else:
+        # Default naming convention: scan-<YYYYMMDD_HHMMSS>_<site>
+        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        site_clean = args.site.replace(".", "_") if args.site else "unknown"
+        workspace_name = f"scan-{ts}_{site_clean}"
+        workspace = Path(__file__).parent / workspace_name
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    # Point the global configuration to this new workspace.
+    os.environ["AEGIS_DATA"] = str(workspace)
+    # Ensure the configuration module reads the new environment variable.
+    import importlib
+    importlib.reload(config)
+    # Ensure that the DB file lives inside the workspace.
+
+    # Redirect stdout/stderr to files inside the workspace.
+    def _redirect_logs() -> None:
+        logs_dir = workspace / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        sys.stdout = open(logs_dir / "stdout.log", "w", encoding="utf-8")
+        sys.stderr = open(logs_dir / "stderr.log", "w", encoding="utf-8")
+
+    _redirect_logs()
+
+    # Ensure the DB directory exists (``db.connect`` will create the file).
     _ensure_database()
     c = db.connect()
     _ensure_sources(c)
@@ -149,6 +186,13 @@ def main() -> None:
             "INSERT OR IGNORE INTO asset(org_id,kind,value,scope,first_seen,last_seen) VALUES(?,?,?,?,strftime('%s','now'),strftime('%s','now'))",
             (org_id, "domain", info["site"], "verified",),
         )
+        # If an IP address was provided, seed it as a candidate asset.
+        ip_addr = info.get("ip")
+        if ip_addr:
+            c.execute(
+                "INSERT OR IGNORE INTO asset(org_id,kind,value,scope,first_seen,last_seen) VALUES(?,?,?,?,strftime('%s','now'),strftime('%s','now'))",
+                (org_id, "ip", ip_addr, "candidate",),
+            )
         # No explicit commit; ``sqlite3`` is in autocommit mode.
 
     # Run a lightweight scan.

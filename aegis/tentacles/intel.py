@@ -36,7 +36,8 @@ class Intel(Tentacle):
             d = fetch_json(
                 f"https://stat.ripe.net/data/prefix-overview/data.json?resource={ip}"
             )["data"]
-        except Exception:
+        except Exception as e:
+            print(f"[intel] RIPEstat error: {e!r}")
             d = {"resource": ip, "asns": []}
         asns = [
             {"asn": int(a["asn"]), "holder": a.get("holder", "")}
@@ -51,7 +52,8 @@ class Intel(Tentacle):
         try:
             try:
                 j = fetch_json(f"https://internetdb.shodan.io/{ip}")
-            except Exception:
+            except Exception as e:
+                print(f"[intel] Shodan InternetDB error: {e!r}")
                 j = {}
             out.append(
                 {
@@ -72,7 +74,8 @@ class Intel(Tentacle):
     def domain_intel(name):
         try:
             d = fetch_json(f"https://rdap.org/domain/{registrable(name)}")
-        except Exception:
+        except Exception as e:
+            print(f"[intel] RDAP error: {e!r}")
             # Any failure (network, HTTP error, JSON decode) results in an
             # empty RDAP record so the caller can proceed.
             return [{"key": "rdap", "value": {}}]

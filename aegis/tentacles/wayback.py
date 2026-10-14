@@ -37,6 +37,7 @@ class Wayback(Tentacle):
                 return out
             except Exception as e:
                 err = e
+                print(f"[wayback] hosts error: {e!r}")
                 time.sleep(2 * (i + 1))
         # If all retries fail, return an empty set to avoid blocking the scan.
         return set()

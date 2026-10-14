@@ -9,21 +9,25 @@ def fetch_json(url, retries=3):
     if cf.exists() and time.time() - cf.stat().st_mtime < 6 * 3600:
         return json.loads(cf.read_text())
     err = None
+    err = None
     for i in range(retries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": config.USER_AGENT})
             data = json.load(urllib.request.urlopen(req, timeout=60))
             cf.write_text(json.dumps(data)); return data
         except urllib.error.HTTPError as e:
-            if 400 <= e.code < 500 and e.code != 429: raise
-            err = e; time.sleep(2 * (i + 1))
+            if 400 <= e.code < 500 and e.code != 429:
+                raise
+            err = e
+            time.sleep(2 * (i + 1))
         except Exception as e:
-            # In restricted environments outbound HTTPS may be blocked.  The
-            # original logic simply retried, which could lead to an infinite
-            # loop in a CI environment.  We now return an empty list so the
-            # caller can gracefully handle the lack of data.
-            err = e; time.sleep(2 * (i + 1))
-    raise err
+            # In restricted environments outbound HTTPS may be blocked.
+            # Retry a few times; after exhausting retries, return empty list.
+            err = e
+            time.sleep(2 * (i + 1))
+        # All retries failed – return an empty list so callers can continue.
+        print(f"[ct] fetch_json error: {err!r}")
+        return []
 
 HOST = re.compile(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$')
 
