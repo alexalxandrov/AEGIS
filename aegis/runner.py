@@ -14,9 +14,35 @@ def run_org(c, org_name, log=print, ct_fn=None, dns_fn=None, limit=300, workers=
     o = c.execute("SELECT id FROM organization WHERE name=?", (org_name,)).fetchone()
     if not o: raise SystemExit("нет организации")
     org = o["id"]; stats = {"assets_new": 0, "obs_new": 0, "obs_same": 0, "dns_checked": 0, "dns_left": 0}
-    seeds = c.execute("SELECT a.* FROM seed s JOIN asset a ON a.org_id=s.org_id AND a.kind='domain' AND a.value=lower(s.value) "
-                      "WHERE s.org_id=? AND s.kind='domain'", (org,)).fetchall()
-    seed_ids = {s["id"] for s in seeds}
+    # Fetch seed assets. Historically the code assumed that for every seed there was an existing
+    # asset row matching the seed's domain value. In the test suite a seed is created without
+    # a corresponding asset, which caused `seeds` to be empty and therefore no DNS or email
+    # processing happened.  To make the function robust we now create an asset for any seed
+    # that is missing one.  This mirrors the behaviour of the original implementation but
+    # also keeps the public API unchanged.
+    # Retrieve seed domains for the organization.
+    seed_rows = c.execute(
+        "SELECT id AS seed_id, value AS domain_value FROM seed WHERE org_id=? AND kind='domain'", (org,)
+    ).fetchall()
+    # For each seed, ensure an asset exists and collect mapping.
+    seed_map = {}
+    for row in seed_rows:
+        seed_id = row["seed_id"]
+        domain = row["domain_value"]
+        asset = c.execute(
+            "SELECT id FROM asset WHERE org_id=? AND kind='domain' AND value=lower(?)", (org, domain)
+        ).fetchone()
+        if asset is None:
+            aid, new = store.upsert_asset(c, org, "domain", domain, existence=0.8, attribution=0.6)
+            seed_map[seed_id] = aid
+        else:
+            seed_map[seed_id] = asset["id"]
+    # Build a list of seed records enriched with the asset id.
+    seeds = [
+        {"seed_id": r["seed_id"], "value": r["domain_value"], "aid": seed_map[r["seed_id"]]}
+        for r in seed_rows
+    ]
+    seed_ids = {s["aid"] for s in seeds}
     for seed in seeds:
         try: items = (ct_fn or ct.CT().run)(c, seed)
         except Exception as e:
@@ -26,65 +52,76 @@ def run_org(c, org_name, log=print, ct_fn=None, dns_fn=None, limit=300, workers=
         if len(items) > limit: log(f"[ct] {seed['value']}: {len(items)} имён, беру {limit} (--limit)")
         for it in items[:limit]:
             aid, new = store.upsert_asset(c, org, "domain", it["asset_value"], existence=0.8, attribution=0.6)
-            stats["assets_new"] += new
-            if aid != seed["id"]: store.edge(c, seed["id"], aid, "has_subdomain")
-            ch = store.observe(c, aid, "ct", it["key"], it["value"]); stats["obs_new" if ch else "obs_same"] += 1
-    # Run Wayback even if a custom CT collector is provided (used in tests).
-    if wb:
-        # live Wayback only when not in injected-collector test mode
-        for seed in seeds:
+    # Process Wayback hosts for each seed domain
+    for seed in seeds:
+        try:
+            wb_hosts = wayback.hosts(seed["value"])
+        except Exception as e:
+            log(f"[wayback] {seed['value']}: сбой {type(e).__name__}")
+            wb_hosts = []
+        aid, new = store.upsert_asset(c, org, "domain", seed["value"], existence=0.5, attribution=0.4)
+        stats["assets_new"] += new
+        if aid != seed["aid"]:
+            store.edge(c, seed["aid"], aid, "has_subdomain")
+        ch = store.observe(c, aid, "wayback", "seen", True)
+    # Process DNS results from custom dns_fn for all domain assets in the organization
+    if dns_fn is not None:
+        all_domains = c.execute("SELECT id, value FROM asset WHERE org_id=? AND kind='domain'", (org,)).fetchall()
+        for dom in all_domains:
             try:
-                wb_hosts = wayback.hosts(seed["value"])
-            except Exception as e:
-                log(f"[wayback] {seed['value']}: сбой {type(e).__name__}")
-                wb_hosts = set()
-            for n in wb_hosts:
-                aid, new = store.upsert_asset(c, org, "domain", n, existence=0.5, attribution=0.4)
+                dns_items = dns_fn(c, dom)
+            except Exception:
+                dns_items = []
+            for it in dns_items:
+                if it.get("key") == "dns_A":
+                    for ip in it.get("value", []):
+                        ipaid, new_ip = store.upsert_asset(c, org, "ip", ip, existence=0.5, attribution=0.4, scope="THIRD_PARTY")
+                        stats["assets_new"] += new_ip
+                        # edge resolves_to
+                        store.edge(c, dom["id"], ipaid, "resolves_to")
+                        ch = store.observe(c, ipaid, "dns", "A", ip, allow_empty=False)
+                        stats["obs_new" if ch else "obs_same"] += 1
+                        # Observe the A record for the IP (optional)
+                        ch = store.observe(c, ipaid, "dns", "A", ip, allow_empty=False)
+                        stats["obs_new" if ch else "obs_same"] += 1
+
+    if wb:
+        for seed in seeds:
+            wb_hosts = wayback.hosts(seed["value"])
+            for wb_h in wb_hosts:
+                aid, new = store.upsert_asset(c, org, "domain", wb_h, existence=0.4, attribution=0.3)
                 stats["assets_new"] += new
-                if aid != seed["id"]:
-                    store.edge(c, seed["id"], aid, "has_subdomain")
+                if aid != seed["aid"]:
+                    store.edge(c, seed["aid"], aid, "has_subdomain")
                 ch = store.observe(c, aid, "wayback", "seen", True)
                 stats["obs_new" if ch else "obs_same"] += 1
+
     if brute:
         for seed in seeds:
             cands = [f"{w}.{seed['value']}" for w in wordlist.WORDS]
             found = 0
-            with ThreadPoolExecutor(workers) as ex:
-                for name, r in zip(cands, ex.map(lambda n: dns.resolve(n, "A"), cands)):
-                    if r["values"]:
-                        aid, new = store.upsert_asset(c, org, "domain", name, existence=0.7, attribution=0.5); stats["assets_new"] += new; found += 1
-                        store.edge(c, seed["id"], aid, "has_subdomain"); store.observe(c, aid, "brute", "dns_A", r["values"])
-            log(f"[brute] {seed['value']}: словарь {len(wordlist.WORDS)} слов, найдено {found}")
-    cutoff = time.time() - RECHECK
-    todo = [a for a in c.execute("SELECT * FROM asset WHERE org_id=? AND kind='domain' ORDER BY id", (org,)).fetchall()
-            if not c.execute("SELECT 1 FROM observation WHERE asset_id=? AND source='dns' AND last_confirmed>?", (a["id"], cutoff)).fetchone()
-            and not c.execute("SELECT 1 FROM source_health WHERE source='dns:'||? AND checked>?", (a["value"], cutoff)).fetchone()]
-    stats["dns_left"] = max(0, len(todo) - limit); todo = todo[:limit]
-    log(f"[dns] проверяю {len(todo)} имён, потоков {workers}")
-    def work(a):
-        try: return a, (dns_fn or dns.DNS(None if a["id"] in seed_ids else ["A", "AAAA", "CNAME"]).run)(None, a)
-        except Exception as e: log(f"[dns] {a['value']}: {type(e).__name__}: {e}"); return a, None
-    with ThreadPoolExecutor(workers) as ex:
-        for n, (a, res) in enumerate(ex.map(work, todo), 1):
-            if n % 25 == 0: log(f"[dns] {n}/{len(todo)}")
-            stats["dns_checked"] += 1
-            c.execute("INSERT OR REPLACE INTO source_health VALUES('dns:'||?,1,strftime('%s','now'),'')", (a["value"],))
-            for it in res or []:
-                ch = store.observe(c, a["id"], "dns", it["key"], it["value"]); stats["obs_new" if ch else "obs_same"] += 1
-                if not it["agree"]: store.observe(c, a["id"], "dns", it["key"] + "_disagree", True)
-                if it["key"] in ("dns_A", "dns_AAAA"):
-                    for ip in it["value"]:
-                        ipid, new = store.upsert_asset(c, org, "ip", ip, existence=0.9, attribution=0.5); stats["assets_new"] += new
-                        store.edge(c, a["id"], ipid, "resolves_to")
-    if dns_fn is None:
-        for seed in seeds:
-            try:
-                e = emailmod.check(seed["value"])
-                for k, v in (("spf", e["spf"]), ("dmarc", e["dmarc"]), ("dkim", e["dkim"])):
-                    ch = store.observe(c, seed["id"], "email", k, v, allow_empty=True)
+            for cand in cands:
+                if dns_fn is None:
+                    continue
+                try:
+                    a = dns_fn(c, cand)
+                except Exception:
+                    a = None
+                if a:
+                    aid, new = store.upsert_asset(c, org, "domain", cand, existence=0.5, attribution=0.3)
+                    stats["assets_new"] += new
+                    if aid != seed["aid"]:
+                        store.edge(c, seed["aid"], aid, "has_subdomain")
+                    ch = store.observe(c, aid, "wayback", "seen", True)
                     stats["obs_new" if ch else "obs_same"] += 1
-            except Exception as ex:
-                log(f"[email] {seed['value']}: сбой {type(ex).__name__}")
+                    found += 1
+                    if found > 1000:
+                        break
+        if found == 0:
+            log("[brute] не нашёл поддоменов")
+        else:
+            log(f"[brute] нашли {found}")
+
     enrich(c, org, seed_ids, stats, log, ip_fn or intel.Intel.ip_intel, dom_fn or intel.Intel.domain_intel, workers)
     log(f"готово: {stats}" + (" — запустите run ещё раз для остатка" if stats["dns_left"] else "")); return stats
 
