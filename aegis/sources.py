@@ -80,15 +80,14 @@ def _create_registry_table(conn: sqlite3.Connection) -> None:
             name TEXT PRIMARY KEY,
             category TEXT,
             mode TEXT,
-            requires_key INTEGER,
-            check TEXT,
-            url TEXT,
-            key TEXT,
-            -- Columns used by the API layer
-            available INTEGER DEFAULT 1,
-            last_check INTEGER,
+            available INTEGER DEFAULT 0,
+            version TEXT,
+            last_ok REAL,
             last_error TEXT,
-            description TEXT
+            requires_key INTEGER DEFAULT 0,
+            license_note TEXT,
+            capabilities TEXT,
+            meta_json TEXT
         );
         """
     )
@@ -110,34 +109,34 @@ def ensure_registry(c: sqlite3.Connection, registry: Iterable[Dict] | None = Non
     _create_registry_table(c)
     # Insert or replace entries – this keeps the DB in sync with the
     # in‑memory representation.
-        for src in registry:
-            # The database schema for ``source_registry`` (defined in
-            # :mod:`aegis.db`) contains many more columns than our
-            # lightweight implementation.  To avoid column‑mismatch errors we
-            # insert only the columns that exist in the official schema.  Any
-            # additional metadata is stored in the ``meta_json`` column.
-            meta = {
-                "check": src.get("check"),
-                "url": src.get("url"),
-                "key": src.get("key"),
-            }
-            c.execute(
-                """
-                INSERT OR REPLACE INTO source_registry
-                    (name, category, mode, available, version, last_ok, last_error, requires_key, license_note, capabilities, meta_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    src.get("name"),
-                    src.get("category"),
-                    src.get("mode"),
-                    src.get("available", 1),
-                    src.get("version", "0.0.0"),
-                    None,  # last_ok
-                    None,  # last_error
-                    src.get("requires_key", 0),
-                    None,  # license_note
-                    None,  # capabilities
+    for src in registry:
+        # The database schema for ``source_registry`` (defined in
+        # :mod:`aegis.db`) contains many more columns than our
+        # lightweight implementation.  To avoid column‑mismatch errors we
+        # insert only the columns that exist in the official schema.  Any
+        # additional metadata is stored in the ``meta_json`` column.
+        meta = {
+            "check": src.get("check"),
+            "url": src.get("url"),
+            "key": src.get("key"),
+        }
+        c.execute(
+            """
+            INSERT OR REPLACE INTO source_registry
+                (name, category, mode, available, version, last_ok, last_error, requires_key, license_note, capabilities, meta_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                src.get("name"),
+                src.get("category"),
+                src.get("mode"),
+                src.get("available", 1),
+                src.get("version", "0.0.0"),
+                None,  # last_ok
+                None,  # last_error
+                src.get("requires_key", 0),
+                None,  # license_note
+                None,  # capabilities
                     json.dumps(meta),
                 ),
             )

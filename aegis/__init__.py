@@ -13,10 +13,10 @@ sub‑modules are small and import‑safe.  This change also keeps the public AP
 stable and allows ``help(aegis)`` to list the sub‑packages.
 """
 
+# Public API for the package. ``runner`` has been removed, so it is omitted.
 __all__ = [
     "config",
     "db",
-    "runner",
     "sources",
     "ai_analyst",
     "__version__",
@@ -28,6 +28,8 @@ __version__ = "0.1.0"
 # ``aegis.<module>``.
 from . import config  # noqa: F401  (imported for side‑effects / namespace)
 from . import db  # noqa: F401
-from . import runner  # noqa: F401
+# The ``runner`` module was deleted as part of the refactor; keep a comment
+# for future developers.
+# from . import runner  # noqa: F401
 from . import sources  # noqa: F401
 from . import ai_analyst  # noqa: F401

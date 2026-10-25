@@ -30,3 +30,13 @@ def skip(message: str | None = None, *, allow_module_level: bool = False):  # pr
     """
 
     raise RuntimeError(message or "skip")
+
+
+def fixture(func):  # pragma: no cover - trivial wrapper
+    """Return ``func`` unchanged.
+
+    This is a minimal stub sufficient for the unit tests which only
+    decorate functions with ``@pytest.fixture``.  No state is required.
+    """
+
+    return func

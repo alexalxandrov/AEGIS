@@ -206,7 +206,6 @@ def execute_run(run_id: int):
                 st = runner.run_org(
                     c,
                     org["name"],
-                    log=log,
                     limit=limit,
                     brute=brute,
                     wb=wayback and "wayback" in srcs,
@@ -245,7 +244,7 @@ def execute_run(run_id: int):
                 except scope.ScopeDenied:
                     pass
             try:
-                st = runner.probe_org(c, org["name"], log=log)
+                st = runner.probe_org(c, org["name"])
                 stats["probe"] = st
                 _task_status(c, run_id, "http_tls", "done", f"probed={st.get('probed', 0)}")
             except Exception as e:

@@ -13,10 +13,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from typing import List, Dict
 
-from .. import (
+from . import (
     __version__,
     ai_analyst,
+    ai_advanced,
     config,
     db,
     diff,
@@ -638,6 +640,34 @@ def create_app() -> FastAPI:
         c = _c()
         _org(c, body.org_id)
         return ai_analyst.ask(c, body.org_id, body.question)
+
+    # --- advanced AI routes --------------------------------------------
+    @app.post("/api/ai/advanced/ask")
+    def ai_advanced_ask(body: AIAskIn):
+        c = _c()
+        _org(c, body.org_id)
+        # Use the cached version
+        return ai_advanced.ask_with_cache(c, body.org_id, body.question)
+
+    @app.post("/api/ai/advanced/ask_with_tools")
+    def ai_advanced_ask_with_tools(body: AIAskIn):
+        c = _c()
+        _org(c, body.org_id)
+        # We need a list of tools; for the API we simply forward all
+        # available tools from the global registry.  The real tool list is
+        # provided by the caller in the request body.  For simplicity, this
+        # endpoint expects the body to contain an additional field
+        # ``tools`` which is a list of tool definitions.  This mirrors the
+        # shape that :func:`ai_advanced.ask_with_tools` expects.
+        from pydantic import BaseModel, Field
+        class ToolsIn(AIAskIn):
+            tools: List[Dict[str, Any]] = Field(default_factory=list)
+
+        # Re‑parse the incoming body to capture tools.
+        tools_body = ToolsIn(**body.dict())
+        return ai_advanced.ask_with_tools(
+            c, tools_body.org_id, tools_body.question, tools_body.tools
+        )
 
     @app.post("/api/ai/explain/{finding_id}")
     def ai_explain(finding_id: int):

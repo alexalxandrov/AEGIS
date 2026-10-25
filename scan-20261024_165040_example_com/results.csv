@@ -1,0 +1,2 @@
+id,org_id,kind,value,scope,existence_conf,attribution_conf,first_seen,last_seen,is_alive,criticality,verified_by,verified_at,verified_method
+1,1,domain,example.com,verified,0.0,0.0,1792860640.0,1792860640.0,1,medium,None,None,None

@@ -14,3 +14,9 @@ BIND_HOST = os.environ.get("AEGIS_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("AEGIS_PORT", "8000"))
 MAX_WORKERS = int(os.environ.get("AEGIS_WORKERS", "16"))
 GRAPH_DEPTH_DEFAULT = int(os.environ.get("AEGIS_GRAPH_DEPTH", "3"))
+
+# --- new cache configuration --------------------------------------------
+# These settings are read by ``aegis.ai_advanced`` to create the global
+# LRUCache instance.  They can be overridden via environment variables.
+CACHE_MAXSIZE = int(os.environ.get("AEGIS_CACHE_MAXSIZE", "128"))
+CACHE_TTL = int(os.environ.get("AEGIS_CACHE_TTL", "300"))

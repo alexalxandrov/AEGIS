@@ -1,5 +1,5 @@
 import argparse, json, sys, urllib.request, socket
-from . import config, db, scope, __version__
+from . import config, db, scope, __version__, ai_analyst, ai_advanced
 
 def cmd_init(a):
     c = db.connect(); print("БД готова:", config.DB_PATH)
@@ -172,6 +172,26 @@ def main():
     x = s.add_parser("digest"); x.add_argument("org"); x.add_argument("--hours", type=float, default=48); x.add_argument("--no-llm", action="store_true"); x.set_defaults(f=cmd_digest)
     x = s.add_parser("scan"); x.add_argument("org"); x.add_argument("--hours", type=float, default=48); x.add_argument("--limit", type=int, default=300); x.add_argument("--no-llm", action="store_true"); x.add_argument("--brute", action="store_true"); x.set_defaults(f=cmd_scan)
     x = s.add_parser("watch"); x.add_argument("org"); x.add_argument("--every", type=float, default=6); x.add_argument("--no-llm", action="store_true"); x.set_defaults(f=cmd_watch)
+    # --- new AI command --------------------------------------------
+    ai_parser = s.add_parser("ai")
+    ai_parser.add_argument("org", help="Organisation name or ID")
+    ai_parser.add_argument("question", help="Question to ask the AI")
+    ai_parser.add_argument("--advanced", action="store_true", help="Use advanced AI with caching and tool support")
+    ai_parser.set_defaults(f=lambda a: cmd_ai(a))
+
+    def cmd_ai(a):
+        c = db.connect()
+        org = c.execute("SELECT id FROM organization WHERE name=? OR id=?", (a.org, a.org)).fetchone()
+        if not org:
+            print("Org not found")
+            sys.exit(1)
+        org_id = org["id"]
+        if a.advanced:
+            result = ai_advanced.ask_with_cache(c, org_id, a.question)
+        else:
+            result = ai_analyst.ask(c, org_id, a.question)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+
     a = p.parse_args(); a.f(a)
 
 if __name__ == "__main__": main()

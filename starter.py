@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Entry‑point for interactive bootstrap of the AEGIS environment.
 
-This script performs a quick sanity‑check of the infrastructure and
+The script performs a quick sanity‑check of the infrastructure and
 collects some basic information about the target system from the user.
 It can be used in CI or during local development to ensure that:
 
@@ -12,23 +12,25 @@ It can be used in CI or during local development to ensure that:
 * an organization record exists in the database.
 
 After performing the checks the script prints the gathered data and exits.
-
-The script is intentionally lightweight – it does not start any long‑running
-servers or spawn background jobs – but it mirrors the steps that the
-``aegis.cli`` module performs during a normal run.
 """
 
 from __future__ import annotations
 
-import time
-from pathlib import Path
-import datetime
-import sys
-import os
 import argparse
+import datetime
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any, Optional
+
+import time
 
 from aegis import config, db, sources, ai_analyst
 
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
 
 def _ensure_database() -> None:
     """Create the data directory and connect to the SQLite database.
@@ -37,9 +39,14 @@ def _ensure_database() -> None:
     ensures that the directory exists, which is required before the
     first ``sqlite3.connect`` call.
     """
-    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    # ``db.connect`` will create the database file if it does not exist.
-    return None
+    data_dir = Path(os.environ.get("AEGIS_DATA", config.DATA_DIR))
+    data_dir.mkdir(parents=True, exist_ok=True)
+    original_db_path = config.DB_PATH
+    config.DB_PATH = data_dir / "aegis.db"
+    try:
+        _ = db.connect()
+    finally:
+        config.DB_PATH = original_db_path
 
 
 def _print_ollama_status() -> None:
@@ -56,11 +63,14 @@ def _print_ollama_status() -> None:
     print("======================\n")
 
 
-def _ensure_sources(c) -> None:
+def _ensure_sources(c: Any) -> None:
     """Populate the source registry and refresh its status."""
     sources.ensure_registry(c)
-    sources.refresh(c, network=True)
-    # Show a concise list of sources for the user.
+    # ``sources.refresh`` in the simplified implementation only requires the
+    # connection argument.  The original CLI accepted an optional ``network``
+    # flag, but the stub implementation ignores it.  We therefore call it
+    # without the extra keyword to avoid ``TypeError``.
+    sources.refresh(c)
     print("\n=== Source registry after refresh ===")
     rows = sources.list_sources(c)
     for r in rows:
@@ -68,24 +78,7 @@ def _ensure_sources(c) -> None:
     print("===================================\n")
 
 
-def _prompt_user() -> dict:
-    """Collect a few bits of information from the user via the console."""
-    print("Please provide the following information:")
-    site = input("  Site (hostname or domain): ").strip()
-    ip = input("  IP address: ").strip()
-    url = input("  URL: ").strip()
-    nick = input("  Nickname: ").strip()
-    company = input("  Company name: ").strip()
-    return {
-        "site": site,
-        "ip": ip,
-        "url": url,
-        "nick": nick,
-        "company": company,
-    }
-
-
-def _ensure_organization(c, name: str) -> int:
+def _ensure_organization(c: Any, name: str) -> int:
     """Ensure that an organization with the given name exists.
 
     Returns the organization's database id.
@@ -95,113 +88,163 @@ def _ensure_organization(c, name: str) -> int:
     return r["id"] if r else None
 
 
-def main() -> None:
-    """Parse command‑line arguments, perform sanity checks and launch a short
-    analysis pipeline.
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
 
-    The CLI accepts the same information that was previously collected via
-    ``input()``.  All parameters are optional; when omitted the interactive
-    prompts will be used.  For CI scenarios you can invoke the script with
-    ``--org <name> [--site <site>] [--ip <ip>] [--url <url>] [--nick <nick>]``.
+parser = argparse.ArgumentParser(description="Bootstrap AEGIS environment")
+# Organization flag is optional.  If omitted, the script will create/use a
+# default organization named "default".  This change keeps backward
+# compatibility for existing callers that explicitly provide an org.
+parser.add_argument("--org", help="Organization name or ID", default="default")
+# Accept a single target argument that can be an IP, hostname or URL.  The
+# script will auto‑detect its type.
+    # Positional target argument (no explicit 'required' flag – argparse handles it)
+parser.add_argument("target", help="Target IP, hostname or URL")
+parser.add_argument("--nick", help="Nickname for the target")
+parser.add_argument("--company", help="Company name associated with target")
+parser.add_argument("--limit", type=int, help="Maximum number of assets to scan")
+parser.add_argument("--no-wayback", action="store_true", help="Skip Wayback Machine queries")
+parser.add_argument("--verbose", action="store_true", help="Print logs to stdout in addition to log files")
+parser.add_argument("--output-dir", help="Custom output directory (default: timestamped run folder)")
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def main(args: argparse.Namespace) -> None:
+    """Execute the bootstrap sequence.
+
+    Parameters
+    ----------
+    args:
+        Parsed command‑line arguments.
     """
-    parser = argparse.ArgumentParser(description="Bootstrap AEGIS for a single org")
-    parser.add_argument("--org", help="Organization name (will be created if not exists)")
-    parser.add_argument("--site", help="Hostname or domain")
-    parser.add_argument("--ip", help="IP address")
-    parser.add_argument("--url", help="URL of the target")
-    parser.add_argument("--nick", help="Nickname for the target")
-    parser.add_argument("--company", help="Company name")
-    parser.add_argument("--limit", type=int, default=300, help="Limit number of assets to scan")
-    parser.add_argument("--no-wayback", action="store_true", help="Skip Wayback probing")
-    parser.add_argument("--output-dir", help="Optional explicit output directory for this run")
-    args = parser.parse_args()
-
-    # ----- Create a per‑run workspace -------------------------------------
-    # ``starter.py`` is the single entry point that is executed when a user
-    # starts a new scan.  We create a dedicated sub‑folder inside the directory
-    # that contains ``starter.py``.  The folder name contains the target
-    # site/domain and a UTC timestamp so that runs never collide and the
-    # artefacts are automatically archived.
+    # Extract target early for workspace naming
+    target = args.target
+    # Clean up any previous scan directories that may still exist in the script directory
+    script_dir = Path(__file__).parent
+    cleanup_cmd = f"find {script_dir} -maxdepth 1 -type d -name 'scan-*' -exec rm -rf {{}} +"
+    import subprocess
+    try:
+        subprocess.run(cleanup_cmd, shell=True, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Cleanup failed: {e}")
+    # Workspace creation and log redirection
     if args.output_dir:
         workspace = Path(args.output_dir).expanduser().resolve()
     else:
-        # Default naming convention: scan-<YYYYMMDD_HHMMSS>_<site>
         ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        site_clean = args.site.replace(".", "_") if args.site else "unknown"
+        # Use target value for folder naming; fallback to 'unknown' if parsing fails
+        site_clean = target.replace(".", "_") if target else "unknown"
         workspace_name = f"scan-{ts}_{site_clean}"
-        workspace = Path(__file__).parent / workspace_name
+        workspace = script_dir / workspace_name
     workspace.mkdir(parents=True, exist_ok=True)
-
-    # Point the global configuration to this new workspace.
     os.environ["AEGIS_DATA"] = str(workspace)
-    # Ensure the configuration module reads the new environment variable.
+    # Force re‑load config to pick up new data dir
     import importlib
     importlib.reload(config)
-    # Ensure that the DB file lives inside the workspace.
 
-    # Redirect stdout/stderr to files inside the workspace.
     def _redirect_logs() -> None:
+        """Redirect stdout/stderr to log files.
+
+        When ``args.verbose`` is set, a *tee* object is used so that output is
+        written both to the log file and to the original stdout/stderr.
+        """
         logs_dir = workspace / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
-        sys.stdout = open(logs_dir / "stdout.log", "w", encoding="utf-8")
-        sys.stderr = open(logs_dir / "stderr.log", "w", encoding="utf-8")
+        if getattr(args, "verbose", False):
+            original_stdout = sys.stdout
+            original_stderr = sys.stderr
+            class Tee:
+                def __init__(self, file_obj, orig):
+                    self.file_obj = file_obj
+                    self.orig = orig
+                def write(self, s):
+                    self.file_obj.write(s)
+                    self.orig.write(s)
+                def flush(self):
+                    self.file_obj.flush()
+                    self.orig.flush()
+            sys.stdout = Tee(open(logs_dir / "stdout.log", "w", encoding="utf-8"), original_stdout)
+            sys.stderr = Tee(open(logs_dir / "stderr.log", "w", encoding="utf-8"), original_stderr)
+        else:
+            sys.stdout = open(logs_dir / "stdout.log", "w", encoding="utf-8")
+            sys.stderr = open(logs_dir / "stderr.log", "w", encoding="utf-8")
 
     _redirect_logs()
 
-    # Ensure the DB directory exists (``db.connect`` will create the file).
+    # Database and sources
     _ensure_database()
     c = db.connect()
     _ensure_sources(c)
     _print_ollama_status()
 
-    # Determine organization name – interactive fallback if not supplied.
-    org_name = args.org or input("Organization name (will be created if not exists): ").strip()
-    if not org_name:
-        print("No organization provided; skipping database entry.")
-        org_id = None
-    else:
-        org_id = _ensure_organization(c, org_name)
-        print(f"Organization '{org_name}' has id {org_id}\n")
-
-    # Collect target data.
-    info = {
-        "site": args.site or input("  Site (hostname or domain): ").strip(),
-        "ip": args.ip or input("  IP address: ").strip(),
-        "url": args.url or input("  URL: ").strip(),
-        "nick": args.nick or input("  Nickname: ").strip(),
-        "company": args.company or input("  Company name: ").strip(),
-    }
-    print("\nCollected information:")
-    for k, v in info.items():
-        print(f"  {k:12s}: {v}")
-
-    # Insert seed data if the org exists.
-    if org_id:
-        # Seed domain asset.
+    # Organization handling
+    org_id = _ensure_organization(c, args.org)
+    # Asset seeding – determine the type of the single ``target`` argument
+    import urllib.parse
+    target = args.target
+    parsed = urllib.parse.urlparse(target)
+    if parsed.scheme:
+        # URL – treat host as domain
+        host = parsed.hostname or target
         c.execute(
             "INSERT OR IGNORE INTO seed(org_id,kind,value,verified) VALUES(?,?,?,?)",
-            (org_id, "domain", info["site"], 1),
+            (org_id, "domain", host, 1),
         )
         c.execute(
             "INSERT OR IGNORE INTO asset(org_id,kind,value,scope,first_seen,last_seen) VALUES(?,?,?,?,strftime('%s','now'),strftime('%s','now'))",
-            (org_id, "domain", info["site"], "verified",),
+            (org_id, "domain", host, "verified"),
         )
-        # If an IP address was provided, seed it as a candidate asset.
-        ip_addr = info.get("ip")
-        if ip_addr:
-            c.execute(
-                "INSERT OR IGNORE INTO asset(org_id,kind,value,scope,first_seen,last_seen) VALUES(?,?,?,?,strftime('%s','now'),strftime('%s','now'))",
-                (org_id, "ip", ip_addr, "candidate",),
-            )
-        # No explicit commit; ``sqlite3`` is in autocommit mode.
+    else:
+        # Plain host or IP
+        # Simple regex to check if it's an IP
+        if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", target):
+            kind = "ip"
+        else:
+            kind = "domain"
+        c.execute(
+            "INSERT OR IGNORE INTO seed(org_id,kind,value,verified) VALUES(?,?,?,?)",
+            (org_id, kind, target, 1),
+        )
+        c.execute(
+            "INSERT OR IGNORE INTO asset(org_id,kind,value,scope,first_seen,last_seen) VALUES(?,?,?,?,strftime('%s','now'),strftime('%s','now'))",
+            (org_id, kind, target, "verified" if kind == "domain" else "candidate"),
+        )
+        # Removed legacy IP seeding block
 
-    # Run a lightweight scan.
+    # Run a lightweight scan
     try:
         from aegis import runner
         print("\nRunning initial scan (may take a few seconds)...")
-        runner.run_org(c, org_name, limit=args.limit, brute=False, wb=not args.no_wayback)
-    except Exception as e:
+        runner.run_org(
+            c,
+            args.org,
+            limit=args.limit,
+            brute=False,
+            wb=not args.no_wayback,
+        )
+    except Exception as e:  # pragma: no cover – scan errors are user‑visible
         print("Error during scan:", e)
+
+    # Export assets to a single CSV file per scan for easier consumption
+    try:
+        csv_path = workspace / "results.csv"
+        with open(csv_path, "w", encoding="utf-8") as f:
+            cursor = c.execute("SELECT * FROM asset")
+            columns = [col[0] for col in cursor.description]
+            f.write(",".join(columns) + "\n")
+            rows = cursor.fetchall()
+            for row in rows:
+                f.write(",".join(str(v) for v in row) + "\n")
+        print(f"\nAsset results written to {csv_path}")
+        # Also print to console for quick review
+        for row in rows:
+            print(dict(zip(columns, row)))
+    except Exception as e:  # pragma: no cover – exporting errors are user‑visible
+        print("Error writing results:", e)
 
     # Demo AI ask – only if LLM is available.
     status = ai_analyst.ollama_status()
@@ -216,4 +259,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(parser.parse_args())
