@@ -379,8 +379,8 @@ def main(args: argparse.Namespace) -> None:
             [f"{r['port']} {r['state']} {r.get('service', '')}" for r in net_results]
         )
         question = f"Проведи анализ сетевого скана {args.target}. Результаты:\n{net_summary}\nДай рекомендации по дальнейшим действиям."
-        answer = ai_analyst.ask(c, org_id, question)
-        print("AI ответ:", answer.get("answer"))
+        ai_response = ai_analyst.ask(c, org_id, question)
+        print("AI ответ:", ai_response.get("answer"))
     else:
         print("Ollama не доступен; пропускаю AI анализ.")
 
@@ -407,13 +407,7 @@ def main(args: argparse.Namespace) -> None:
         print("Error writing results:", e)
 
     # Demo AI ask – only if LLM is available.
-    status = ai_analyst.ollama_status()
-    if status.get("available") and status.get("preferred_present"):
-        print("\nAsking AI for a quick summary...")
-        answer = ai_analyst.ask(c, org_id, "Summarize findings for this organization.")
-        print("AI answer:", answer.get("answer"))
-    else:
-        print("Ollama not available; skipping AI ask.")
+    # The original quick‑summary block is omitted to avoid duplicate AI calls.
 
     print("\nDone.")
 
