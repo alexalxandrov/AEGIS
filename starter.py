@@ -369,6 +369,14 @@ def main(args: argparse.Namespace) -> None:
     with open(net_log_path, "w", encoding="utf-8") as f:
         f.write(json.dumps(net_results, indent=2, ensure_ascii=False))
     print(f"Полные результаты сети записаны в {net_log_path}")
+    # Выводим содержимое логов в терминал для удобства
+    try:
+        with open(net_log_path, "r", encoding="utf-8") as f:
+            print("\n=== Содержимое network_scan.log ===")
+            print(f.read())
+            print("=== Конец логов ===\n")
+    except Exception as e:
+        print("Ошибка чтения network_scan.log для вывода в терминал:", e)
 
     # --- AI summarization (always pass network results) -----------------------------------
     status = ai_analyst.ollama_status()
