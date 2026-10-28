@@ -1,0 +1,3 @@
+id,org_id,kind,value,scope,existence_conf,attribution_conf,first_seen,last_seen,is_alive,criticality,verified_by,verified_at,verified_method
+1,1,ip,192.168.0.1,candidate,0.0,0.0,1793217672.0,1793217672.0,1,medium,None,None,None
+2,1,domain,192.168.0.1,VERIFIED,0.0,0.0,1793217672.923819,1793217672.923819,1,medium,None,None,None
