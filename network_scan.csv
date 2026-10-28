@@ -1,0 +1,8 @@
+# Host,Port,State,Service
+127.0.0.1,5000,open,rtsp
+127.0.0.1,7000,open,rtsp
+127.0.0.1,9993,open,palace-2
+127.0.0.1,11434,open,http
+127.0.0.1,49162,open,bandwidth-test
+127.0.0.1,49242,open,unknown
+127.0.0.1,49347,open,http

@@ -1,0 +1,9 @@
+[
+  {"host": "127.0.0.1", "port": 5000, "state": "open", "service": "rtsp"},
+  {"host": "127.0.0.1", "port": 7000, "state": "open", "service": "rtsp"},
+  {"host": "127.0.0.1", "port": 9993, "state": "open", "service": "palace-2"},
+  {"host": "127.0.0.1", "port": 11434, "state": "open", "service": "http"},
+  {"host": "127.0.0.1", "port": 49162, "state": "open", "service": "bandwidth-test"},
+  {"host": "127.0.0.1", "port": 49242, "state": "open", "service": "unknown"},
+  {"host": "127.0.0.1", "port": 49347, "state": "open", "service": "http"}
+]

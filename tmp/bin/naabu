@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""Dummy `naabu` binary used for unit‑test style execution.
+
+The real scanner expects the command to be called with ``-cidr SUBNET`` and
+output one JSON line per host/port discovery.  For the purposes of this
+exercise we emit two fake open ports for every host in the CIDR.
+"""
+
+import sys
+import json
+import ipaddress
+
+def main():
+    # Parse minimal arguments – we only support the exact form used by starter.
+    if "-cidr" not in sys.argv:
+        sys.exit(1)
+    cidr_index = sys.argv.index("-cidr") + 1
+    subnet = sys.argv[cidr_index]
+    net = ipaddress.ip_network(subnet, strict=False)
+    # Emit one host with two ports
+    for host in net.hosts():
+        for port in (80, 443):
+            print(json.dumps({"host": str(host), "port": port, "proto": "tcp"}))
+            sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1781 @@
+{\rtf1\ansi\ansicpg1251\cocoartf2870
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 #!/usr/bin/env python3\
+"""\
+Full-pipeline IPv4 inventory scanner.\
+\
+Phases per run:\
+  DISCOVERY (round 1)     \'97 masscan (TCP+UDP) or asyncio TCP + ICMP fallback.\
+  FULL PORT SCAN          \'97 1-65535 per host (masscan / asyncio).\
+  SERVICE CONFIRMATION    \'97 regex on banners; only confirmed services count.\
+  ENRICHMENT              \'97 PTR, NetBIOS, mDNS, SSDP, TLS, SNMP, NTP,\
+                            DNS recursion, HTTP OPTIONS/headers, traceroute, ARP.\
+  BRUTE-FORCE             \'97 after scan, only on confirmed services.\
+  DISCOVERY (round 2)     \'97 catch hosts that appeared meanwhile.\
+  DISCOVERY (round 3)     \'97 confirmation.\
+\
+Progress in output/inventory.sqlite3. Results in CSV + JSON.\
+"""\
+\
+from __future__ import annotations\
+\
+import argparse\
+import asyncio\
+import base64\
+import csv\
+import http.client\
+import ipaddress\
+import json\
+import os\
+import re\
+import shutil\
+import socket\
+import sqlite3\
+import ssl\
+import struct\
+import subprocess\
+import sys\
+import time\
+import urllib.error\
+import urllib.request\
+from concurrent.futures import ThreadPoolExecutor, as_completed\
+from datetime import datetime, timezone\
+from pathlib import Path\
+from typing import Any\
+\
+# --------------------------- optional modules ------------------------------\
+try:\
+    import paramiko;  HAVE_SSH = True\
+except ImportError:\
+    paramiko = None; HAVE_SSH = False\
+\
+try:\
+    import telnetlib;  HAVE_TELNET = True\
+except ImportError:\
+    telnetlib = None; HAVE_TELNET = False\
+\
+try:\
+    import ftplib;  HAVE_FTP = True\
+except ImportError:\
+    ftplib = None; HAVE_FTP = False\
+\
+try:\
+    import pymysql;  HAVE_MYSQL = True\
+except ImportError:\
+    pymysql = None; HAVE_MYSQL = False\
+\
+try:\
+    import psycopg2;  HAVE_PG = True\
+except ImportError:\
+    psycopg2 = None; HAVE_PG = False\
+\
+try:\
+    import redis;  HAVE_REDIS = True\
+except ImportError:\
+    redis = None; HAVE_REDIS = False\
+\
+try:\
+    import pymongo;  HAVE_MONGO = True\
+except ImportError:\
+    pymongo = None; HAVE_MONGO = False\
+\
+try:\
+    from impacket.smbconnection import SMBConnection\
+    HAVE_IMPACKET = True\
+except ImportError:\
+    SMBConnection = None; HAVE_IMPACKET = False\
+\
+# ===========================================================================\
+# MODULE-LEVEL CONSTANTS\
+# ===========================================================================\
+SCRIPT_DIR = Path(__file__).resolve().parent\
+OUTPUT_DIR = SCRIPT_DIR / "output"\
+DB_PATH = OUTPUT_DIR / "inventory.sqlite3"\
+DISCOVERED_CSV = OUTPUT_DIR / "discovered.csv"\
+HOSTS_CSV = OUTPUT_DIR / "hosts_found.csv"\
+CREDS_CSV = OUTPUT_DIR / "credentials_found.csv"\
+ENRICH_CSV = OUTPUT_DIR / "enrichment.csv"\
+RESULTS_JSON = OUTPUT_DIR / "results.json"\
+\
+RIR_URLS = \{\
+    "apnic":   "https://ftp.apnic.net/stats/apnic/delegated-apnic-latest",\
+    "arin":    "https://ftp.arin.net/pub/stats/arin/delegated-arin-extended-latest",\
+    "ripencc": "https://ftp.ripe.net/ripe/stats/delegated-ripencc-latest",\
+    "lacnic":  "https://ftp.lacnic.net/pub/stats/lacnic/delegated-lacnic-latest",\
+    "afrinic": "https://ftp.afrinic.net/pub/stats/afrinic/delegated-afrinic-latest",\
+\}\
+\
+QUICK_PORTS = [21,22,23,25,53,80,110,111,135,139,143,443,445,465,587,\
+               554,631,993,995,1433,1521,1883,3000,3306,3389,5000,\
+               5432,5900,5985,5986,6379,8000,8080,8443,8888,9000,\
+               9100,9200,11211,27017]\
+\
+TCP_BEACON_DEFAULT = [80, 443, 22, 445, 3389, 8080, 21, 23, 8000, 8443,\
+                      554, 631, 5000, 9100, 1883]\
+UDP_BEACON_DEFAULT = [53, 123, 137, 161, 1900, 5353]\
+\
+TLS_PORTS = \{443, 465, 636, 853, 990, 993, 995, 8443, 8883, 5986\}\
+HTTP_PORTS = \{80, 81, 443, 3000, 5000, 8000, 8008, 8080, 8081, 8443, 8888, 9000, 9200, 5001\}\
+HTTPS_PORTS = \{443, 8443\}\
+\
+EPHEMERAL_MIN = 32768  # Linux default ephemeral range\
+\
+# ===========================================================================\
+# ANSI STYLE\
+# ===========================================================================\
+class C:\
+    RESET = "\\033[0m"; BOLD = "\\033[1m"; DIM = "\\033[2m"\
+    AMBER = "\\033[33m"; GREEN = "\\033[32m"; CYAN = "\\033[36m"\
+    RED = "\\033[31m"; MAGENTA = "\\033[35m"; WHITE = "\\033[97m"\
+\
+def cprint(text, color=C.AMBER, bold=False, dim=False, end="\\n"):\
+    prefix = (C.BOLD if bold else "") + (C.DIM if dim else "")\
+    print(f"\{prefix\}\{color\}\{text\}\{C.RESET\}", end=end)\
+\
+def frame(title, color=C.CYAN, width=78):\
+    bar = "\uc0\u9552 " * (width - 2)\
+    cprint(f"\uc0\u9556 \{bar\}\u9559 ", color)\
+    cprint(f"\uc0\u9553  \{title:<\{width-4\}\} \u9553 ", color, bold=True)\
+    cprint(f"\uc0\u9562 \{bar\}\u9565 ", color)\
+\
+def banner():\
+    art = r"""\
+   \uc0\u9608 \u9608 \u9608 \u9608 \u9608 \u9608 \u9559  \u9608 \u9608 \u9559    \u9608 \u9608 \u9559 \u9608 \u9608 \u9608 \u9608 \u9608 \u9608 \u9608 \u9559 \u9608 \u9608 \u9608 \u9608 \u9608 \u9608 \u9559  \u9608 \u9608 \u9559    \u9608 \u9608 \u9559 \u9608 \u9608 \u9559 \u9608 \u9608 \u9608 \u9608 \u9608 \u9608 \u9608 \u9559 \u9608 \u9608 \u9559     \u9608 \u9608 \u9559 \
+  \uc0\u9608 \u9608 \u9556 \u9552 \u9552 \u9552 \u9608 \u9608 \u9559 \u9608 \u9608 \u9553    \u9608 \u9608 \u9553 \u9608 \u9608 \u9556 \u9552 \u9552 \u9552 \u9552 \u9565 \u9608 \u9608 \u9556 \u9552 \u9552 \u9608 \u9608 \u9559 \u9608 \u9608 \u9553    \u9608 \u9608 \u9553 \u9608 \u9608 \u9553 \u9608 \u9608 \u9556 \u9552 \u9552 \u9552 \u9552 \u9565 \u9608 \u9608 \u9553     \u9608 \u9608 \u9553 \
+  \uc0\u9608 \u9608 \u9553    \u9608 \u9608 \u9553 \u9608 \u9608 \u9553    \u9608 \u9608 \u9553 \u9608 \u9608 \u9608 \u9608 \u9608 \u9559   \u9608 \u9608 \u9608 \u9608 \u9608 \u9608 \u9556 \u9565 \u9608 \u9608 \u9553    \u9608 \u9608 \u9553 \u9608 \u9608 \u9553 \u9608 \u9608 \u9608 \u9608 \u9608 \u9559   \u9608 \u9608 \u9553  \u9608 \u9559  \u9608 \u9608 \u9553 \
+  \uc0\u9608 \u9608 \u9553 \u9604 \u9604  \u9608 \u9608 \u9553 \u9562 \u9608 \u9608 \u9559  \u9608 \u9608 \u9556 \u9565 \u9608 \u9608 \u9556 \u9552 \u9552 \u9565   \u9608 \u9608 \u9556 \u9552 \u9552 \u9608 \u9608 \u9559 \u9562 \u9608 \u9608 \u9559  \u9608 \u9608 \u9556 \u9565 \u9608 \u9608 \u9553 \u9608 \u9608 \u9556 \u9552 \u9552 \u9565   \u9608 \u9608 \u9553 \u9608 \u9608 \u9608 \u9559 \u9608 \u9608 \u9553 \
+  \uc0\u9562 \u9608 \u9608 \u9608 \u9608 \u9608 \u9608 \u9556 \u9565  \u9562 \u9608 \u9608 \u9608 \u9608 \u9556 \u9565  \u9608 \u9608 \u9608 \u9608 \u9608 \u9608 \u9608 \u9559 \u9608 \u9608 \u9553   \u9608 \u9608 \u9553  \u9562 \u9608 \u9608 \u9608 \u9608 \u9556 \u9565  \u9608 \u9608 \u9553 \u9608 \u9608 \u9608 \u9608 \u9608 \u9608 \u9608 \u9559 \u9562 \u9608 \u9608 \u9608 \u9556 \u9608 \u9608 \u9608 \u9556 \u9565 \
+   \uc0\u9562 \u9552 \u9552 \u9600 \u9600 \u9552 \u9565    \u9562 \u9552 \u9552 \u9552 \u9565   \u9562 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9565 \u9562 \u9552 \u9565   \u9562 \u9552 \u9565   \u9562 \u9552 \u9552 \u9552 \u9565   \u9562 \u9552 \u9565 \u9562 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9565  \u9562 \u9552 \u9552 \u9565 \u9562 \u9552 \u9552 \u9565 \
+    """\
+    cprint(art, C.AMBER, bold=True)\
+    cprint("        N E T W O R K   I N V E N T O R Y   S C A N N E R", C.GREEN, bold=True)\
+    cprint("                       v4.0", C.DIM, dim=True)\
+\
+def status(msg, color=C.GREEN):\
+    print(f"\{C.BOLD\}\{color\}[\'bb]\{C.RESET\} \{msg\}")\
+\
+def warn(msg):\
+    print(f"\{C.BOLD\}\{C.AMBER\}[!]\{C.RESET\} \{C.AMBER\}\{msg\}\{C.RESET\}")\
+\
+def error(msg):\
+    print(f"\{C.BOLD\}\{C.RED\}[\uc0\u10007 ]\{C.RESET\} \{C.RED\}\{msg\}\{C.RESET\}")\
+\
+def progress_bar(done, total, found, width=40):\
+    if total == 0:\
+        return\
+    filled = int(width * done / total)\
+    bar = "\uc0\u9608 " * filled + "\u9617 " * (width - filled)\
+    pct = 100 * done / total\
+    cprint(f"\\r  [\{bar\}] \{done\}/\{total\} (\{pct:.0f\}%) \'b7 \uc0\u1085 \u1072 \u1081 \u1076 \u1077 \u1085 \u1086 : \{found\}",\
+           C.CYAN, dim=True, end="")\
+    if done == total:\
+        print()\
+\
+# ===========================================================================\
+# SIGNATURES\
+# ===========================================================================\
+SERVICE_SIGNATURES: list[tuple[str, str, str]] = [\
+    # IoT binary protocols\
+    (r"^\\x81\\x00",                              "XMEye",          "Xiongmai binary"),\
+    (r"^\\xf6\\x00",                              "XMEye-DVR",      "Xiongmai DVR"),\
+    (r"^HTTP/1\\.[01].*XMEye",                   "XMEye-Web",      "XMEye web UI"),\
+    (r"^HTTP/1\\.[01].*Dahua",                   "Dahua-Web",      "Dahua web UI"),\
+    (r"^HTTP/1\\.[01].*Hikvision",               "Hikvision-Web",  "Hikvision web UI"),\
+    (r"^HTTP/1\\.[01].*UC-httpd",                "UC-httpd",       "GoAhead/XMEye"),\
+    (r"^HTTP/1\\.[01].*Server: webs",            "Webs",           "Dahua/Hikvision"),\
+    (r"^HTTP/1\\.[01].*App-webs",                "App-webs",       "XMEye web UI"),\
+    # Standard services\
+    (r"^SSH-[\\d.]+-OpenSSH[_\\d.]+",             "SSH/OpenSSH",    "OpenSSH"),\
+    (r"^SSH-[\\d.]+-",                           "SSH",            "SSH"),\
+    (r"^HTTP/1\\.[01] \\d\{3\}",                    "HTTP",           "HTTP"),\
+    (r"^HTTP/2 ",                               "HTTP/2",         "HTTP/2"),\
+    (r"^220[- ].*SMTP",                         "SMTP",           "SMTP"),\
+    (r"^220[- ].*ftp",                          "FTP",            "FTP"),\
+    (r"^220[- ].*Microsoft ESMTP",              "SMTP/Exchange",  "Exchange"),\
+    (r"^220 .*Postfix",                         "SMTP/Postfix",   "Postfix"),\
+    (r"^220 .*Exim",                            "SMTP/Exim",      "Exim"),\
+    (r"^220 .*Dovecot",                         "IMAP/Dovecot",   "Dovecot"),\
+    (r"^220 .*FileZilla",                       "FTP/FileZilla",  "FileZilla"),\
+    (r"^220 .*vsftpd",                          "FTP/vsftpd",     "vsftpd"),\
+    (r"^220 .*ProFTPD",                         "FTP/ProFTPD",    "ProFTPD"),\
+    (r"^\\* OK.*IMAP",                           "IMAP",           "IMAP"),\
+    (r"^\\* BYE",                                "IMAP",           "IMAP BYE"),\
+    (r"^\\+OK",                                  "POP3",           "POP3"),\
+    (r"^\\xff\\xfd",                              "Telnet",         "Telnet IAC"),\
+    (r"^RFB \\d\{3\}\\.\\d\{3\}",                      "VNC",            "RFB"),\
+    (r"^MySQL",                                 "MySQL",          "MySQL"),\
+    (r"^\\x00\\x00\\x00\\x0a",                      "MySQL",          "MySQL packet"),\
+    (r"^PostgreSQL",                            "PostgreSQL",     "PostgreSQL"),\
+    (r"^-ERR unknown command",                  "Redis",          "Redis"),\
+    (r"^\\+PONG",                                "Redis",          "Redis PONG"),\
+    (r"^\\x00\\x00\\x00",                          "MongoDB",        "MongoDB"),\
+    (r"^AMQP",                                  "AMQP/RabbitMQ",  "AMQP"),\
+    (r"^MQTT",                                  "MQTT",           "MQTT"),\
+    (r"^RTSP/1\\.0",                             "RTSP",           "RTSP"),\
+    (r"^SIP/2\\.0",                              "SIP",            "SIP"),\
+    (r"^OK .*LPD",                              "LPD",            "LPD"),\
+    (r"^\\x1f\\x8b",                              "HTTP/gzip",      "gzip"),\
+    (r"^HELO",                                  "SMTP",           "SMTP HELO"),\
+    (r"^EHLO",                                  "SMTP",           "SMTP EHLO"),\
+    (r"^-ERR",                                  "POP3/Redis",     "Generic -ERR"),\
+    (r"^RFB",                                   "VNC",            "RFB"),\
+]\
+\
+PORT_GUESS = \{\
+    21:"FTP", 22:"SSH", 23:"Telnet", 25:"SMTP", 53:"DNS", 80:"HTTP",\
+    110:"POP3", 111:"rpcbind", 135:"MS-RPC", 137:"NetBIOS-NS",\
+    139:"NetBIOS-SSN", 143:"IMAP", 443:"HTTPS", 445:"SMB", 465:"SMTPS",\
+    587:"SMTP-submission", 554:"RTSP", 631:"IPP/printer", 993:"IMAPS",\
+    995:"POP3S", 1433:"MS-SQL", 1521:"Oracle-DB", 1883:"MQTT",\
+    3000:"HTTP-alt", 3306:"MySQL", 3389:"RDP", 5000:"HTTP-alt",\
+    5432:"PostgreSQL", 5900:"VNC", 5985:"WinRM-HTTP", 5986:"WinRM-HTTPS",\
+    6379:"Redis", 7676:"XMEye-P2P", 7678:"XMEye-P2P",\
+    8000:"Hikvision/XMEye", 8080:"HTTP-alt", 8443:"HTTPS-alt",\
+    8888:"HTTP-alt", 9000:"HTTP-alt", 9100:"JetDirect-printer",\
+    9119:"XMEye", 9197:"XMEye", 9200:"Elasticsearch",\
+    9999:"XMEye-DVR", 11211:"Memcached", 15500:"Xiongmai-PTZ",\
+    27017:"MongoDB", 34567:"DVR-XMEye", 37777:"Dahua-SDK",\
+    5431:"?",\
+\}\
+\
+IOT_FINGERPRINTS = \{\
+    "Xiongmai/XMEye camera": \{7676, 7678, 9119, 9197, 9999, 15500, 34567\},\
+    "Dahua camera/DVR":      \{37777, 80, 443, 554\},\
+    "Hikvision camera/DVR":  \{8000, 554, 443, 8443\},\
+    "Foscam camera":         \{88, 443, 888, 554\},\
+    "Synology NAS":          \{5000, 5001, 445, 22\},\
+    "Axis camera":           \{80, 443, 554\},\
+    "Apple AirPort":         \{5000, 7000, 5353\},\
+\}\
+\
+# CVE hints by banner signature (informational, not active exploitation)\
+CVE_HINTS = [\
+    (r"OpenSSH[_\\s]*([0-9]+\\.[0-9]+)", "OpenSSH",\
+     \{"7.2": ["CVE-2016-6210 user enumeration"],\
+      "7.4": ["CVE-2018-15919"], "8.5": ["CVE-2021-41617"], "8.6": ["CVE-2021-41617"]\}),\
+    (r"Apache/([0-9]+\\.[0-9]+\\.[0-9]+)", "Apache",\
+     \{"2.4.49": ["CVE-2021-41773 path traversal"],\
+      "2.4.50": ["CVE-2021-42013 path traversal"]\}),\
+    (r"nginx/([0-9]+\\.[0-9]+\\.[0-9]+)", "nginx",\
+     \{"1.16": ["old stable, consider upgrade"], "1.18": ["old stable"]\}),\
+    (r"vsftpd[ _]([0-9.]+)", "vsftpd",\
+     \{"2.3.4": ["CVE-2011-2523 backdoor"]\}),\
+    (r"ProFTPD[ _]([0-9.]+)", "ProFTPD",\
+     \{"1.3.5": ["CVE-2019-12815"], "1.3.3": ["CVE-2015-3306 mod_copy"]\}),\
+]\
+\
+def confirm_service(port: int, banner: str) -> tuple[str, str]:\
+    if not banner:\
+        return "", ""\
+    text = banner.strip()\
+    for pattern, name, desc in SERVICE_SIGNATURES:\
+        try:\
+            if re.search(pattern, text, re.IGNORECASE | re.MULTILINE):\
+                return name, desc\
+        except re.error:\
+            continue\
+    return "", ""\
+\
+def cve_hints_for(banner: str) -> list[str]:\
+    hints = []\
+    for pattern, product, versions in CVE_HINTS:\
+        m = re.search(pattern, banner)\
+        if not m:\
+            continue\
+        version = m.group(1) if m.groups() else ""\
+        for v, cves in versions.items():\
+            if version.startswith(v):\
+                hints.extend(f"\{product\} \{version\}: \{c\}" for c in cves)\
+    return hints\
+\
+# ===========================================================================\
+# HELPERS\
+# ===========================================================================\
+def utc_now() -> str:\
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")\
+\
+def clean_text(raw, limit=600) -> str:\
+    if isinstance(raw, bytes):\
+        value = raw.decode("utf-8", errors="replace")\
+    else:\
+        value = raw\
+    value = value.replace("\\x00", " ")\
+    value = re.sub(r"[\\x01-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f]", " ", value)\
+    value = re.sub(r"\\s+", " ", value).strip()\
+    return value[:limit]\
+\
+def estimate_distance_km(rtt):\
+    return round((rtt / 2.0) * 200.0, 1) if rtt is not None else None\
+\
+def ping_host(ip):\
+    ping_bin = shutil.which("ping")\
+    if not ping_bin:\
+        return False, None, None\
+    try:\
+        proc = subprocess.run([ping_bin, "-n", "-c", "1", "-W", "1", ip],\
+                              capture_output=True, text=True, timeout=2.2, check=False)\
+    except (OSError, subprocess.TimeoutExpired):\
+        return False, None, None\
+    out = (proc.stdout or "") + " " + (proc.stderr or "")\
+    m = re.search(r"time[=<]([0-9.]+)\\s*ms", out, re.IGNORECASE)\
+    rtt = float(m.group(1)) if m else None\
+    mt = re.search(r"ttl[=:]\\s*(\\d+)", out, re.IGNORECASE)\
+    ttl = int(mt.group(1)) if mt else None\
+    return proc.returncode == 0, rtt, ttl\
+\
+def os_hint_from_ttl(ttl):\
+    if ttl is None: return ""\
+    if ttl <= 64: return "Linux/Unix"\
+    if ttl <= 128: return "Windows"\
+    if ttl <= 255: return "Network/BSD"\
+    return ""\
+\
+def try_netbios(ip, timeout=0.8):\
+    try:\
+        packet = (b"\\x00\\x00\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00"\
+                  b"\\x20CK" + b"A"*30 + b"\\x00\\x00\\x21\\x00\\x01")\
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\
+        s.settimeout(timeout); s.sendto(packet, (ip, 137))\
+        data, _ = s.recvfrom(1024); s.close()\
+        if len(data) < 57: return ""\
+        num = data[56]; pos = 57\
+        for _ in range(num):\
+            if pos + 18 > len(data): break\
+            name = data[pos:pos+15].decode("ascii", errors="ignore").rstrip()\
+            suffix = data[pos+15]; pos += 18\
+            if name and suffix == 0x00: return name\
+        return ""\
+    except Exception:\
+        return ""\
+\
+def reverse_hostname(ip):\
+    try:\
+        h = socket.gethostbyaddr(ip)[0]\
+    except Exception:\
+        return "", False\
+    try:\
+        return h, socket.gethostbyname(h) == ip\
+    except Exception:\
+        return h, False\
+\
+def arp_lookup(ip):\
+    """Read MAC from local ARP table (only works for same subnet)."""\
+    try:\
+        proc = subprocess.run(["ip", "neigh", "show", ip],\
+                              capture_output=True, text=True, timeout=2)\
+        m = re.search(r"lladdr ([0-9a-f:]+)", proc.stdout, re.IGNORECASE)\
+        return m.group(1) if m else ""\
+    except Exception:\
+        return ""\
+\
+def parse_http_response(data):\
+    text = data.decode("iso-8859-1", errors="replace")\
+    header, _, body = text.partition("\\r\\n\\r\\n")\
+    lines = header.splitlines()\
+    sl = lines[0].strip() if lines else ""\
+    server = ""\
+    headers = \{\}\
+    for line in lines[1:]:\
+        if ":" in line:\
+            k, _, v = line.partition(":")\
+            headers[k.strip().lower()] = v.strip()\
+            if k.strip().lower() == "server":\
+                server = clean_text(v, 200)\
+    m = re.search(r"<title[^>]*>(.*?)</title\\s*>", body, re.I | re.S)\
+    title = clean_text(re.sub(r"<[^>]+>", " ", m.group(1)), 200) if m else ""\
+    return clean_text(sl, 200), server, title, headers\
+\
+# ===========================================================================\
+# DISCOVERY\
+# ===========================================================================\
+async def _probe_tcp(ip, port, timeout, sem):\
+    async with sem:\
+        try:\
+            _, w = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout)\
+        except Exception:\
+            return False\
+        try:\
+            w.close(); await asyncio.wait_for(w.wait_closed(), timeout=0.3)\
+        except Exception:\
+            pass\
+        return True\
+\
+async def _discover_one(ip, ports, timeout, sem):\
+    tasks = \{asyncio.create_task(_probe_tcp(ip, p, timeout, sem)): p for p in ports\}\
+    try:\
+        while tasks:\
+            done, pending = await asyncio.wait(tasks.keys(), return_when=asyncio.FIRST_COMPLETED)\
+            for t in done:\
+                if t.cancelled() or t.exception() is not None:\
+                    continue\
+                if t.result() is True:\
+                    port = tasks[t]\
+                    for p in pending: p.cancel()\
+                    return port\
+            tasks = \{t: tasks[t] for t in pending\}\
+        return None\
+    finally:\
+        for t in tasks:\
+            if not t.done(): t.cancel()\
+\
+async def _discovery_async(ips, beacon_ports, timeout, concurrency, on_found, on_progress):\
+    sem = asyncio.Semaphore(concurrency)\
+    found = \{\}\
+    total = len(ips); done = 0\
+    batch_size = max(200, concurrency * 4)\
+    async def _one(ip):\
+        port = await _discover_one(ip, beacon_ports, timeout, sem)\
+        if port is not None:\
+            found[ip] = port\
+            on_found(ip, port)\
+    for start in range(0, total, batch_size):\
+        batch = ips[start:start + batch_size]\
+        await asyncio.gather(*[_one(ip) for ip in batch])\
+        done += len(batch)\
+        on_progress(done, total, len(found))\
+    return found\
+\
+def _icmp_fallback(ips, conn):\
+    found = \{\}\
+    if not shutil.which("ping") or not ips:\
+        return found\
+    status(f"ICMP fallback on \{len(ips)\} hosts", C.DIM)\
+    with ThreadPoolExecutor(max_workers=min(64, len(ips))) as pool:\
+        futures = \{pool.submit(ping_host, ip): ip for ip in ips\}\
+        for f in as_completed(futures):\
+            ip = futures[f]\
+            try:\
+                ok, rtt, _ = f.result()\
+                if ok:\
+                    found[ip] = rtt\
+                    save_discovered(conn, ip, None, "icmp", rtt)\
+                    cprint(f"  + \{ip\} (icmp)", C.GREEN)\
+            except Exception:\
+                continue\
+    return found\
+\
+def masscan_available():\
+    """masscan is usable only if binary is present AND we have root."""\
+    return shutil.which("masscan") is not None and os.geteuid() == 0\
+\
+def _discovery_masscan(networks, tcp_ports, udp_ports, rate):\
+    if not masscan_available():\
+        return None\
+    ports_arg = ",".join(str(p) for p in tcp_ports)\
+    if udp_ports:\
+        ports_arg += ",U:" + ",".join(str(p) for p in udp_ports)\
+    cmd = ["masscan", "-p", ports_arg, "--rate", str(rate),\
+           "-oL", "-", "--wait", "3"] + [str(n) for n in networks]\
+    status(f"masscan @ \{rate\} pps (TCP+UDP)", C.CYAN)\
+    try:\
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)\
+    except Exception as exc:\
+        warn(f"masscan failed: \{exc\}"); return None\
+    if proc.returncode != 0:\
+        warn(f"masscan exit \{proc.returncode\}: \{(proc.stderr or '')[:200]\}")\
+        return None\
+    found = \{\}\
+    for line in proc.stdout.splitlines():\
+        p = line.split()\
+        if len(p) >= 4 and p[0] == "open":\
+            try:\
+                port = int(p[2]); ip = p[3]\
+            except (ValueError, IndexError):\
+                continue\
+            found.setdefault(ip, port)\
+    return found\
+\
+def discovery_pass(ips, networks, args, conn, label):\
+    frame(f"\{label\} \'97 DISCOVERY", C.CYAN)\
+    already = \{ip for (ip,) in conn.execute("SELECT ip FROM discovered")\} & set(ips)\
+    to_check = [ip for ip in ips if ip not in already]\
+    status(f"To check: \{len(to_check)\} (known: \{len(already)\})")\
+\
+    if to_check:\
+        use_masscan = (\
+            args.masscan_enabled\
+            and masscan_available()\
+            and len(to_check) >= 16\
+        )\
+        if args.masscan_enabled and not masscan_available():\
+            if shutil.which("masscan") is None:\
+                status("masscan not installed \'97 using asyncio fallback", C.DIM)\
+            else:\
+                status("masscan needs root \'97 using asyncio fallback", C.DIM)\
+\
+        if use_masscan:\
+            found = _discovery_masscan(networks, args.beacon_ports,\
+                                       args.udp_beacon_ports, args.masscan_rate)\
+            if found is not None:\
+                for ip, port in found.items():\
+                    save_discovered(conn, ip, port, "masscan")\
+            else:\
+                use_masscan = False\
+\
+        if not use_masscan:\
+            start = time.time(); last = [0.0]\
+            def on_found(ip, port):\
+                save_discovered(conn, ip, port, "tcp")\
+                cprint(f"  + \{ip\}:\{port\}", C.GREEN)\
+            def on_progress(done, total, found_count):\
+                now = time.time()\
+                if now - last[0] >= 1.0 or done == total:\
+                    last[0] = now\
+                    progress_bar(done, total, found_count)\
+            try:\
+                asyncio.run(_discovery_async(to_check, args.beacon_ports,\
+                                             args.timeout, args.concurrency,\
+                                             on_found, on_progress))\
+            except KeyboardInterrupt:\
+                warn("Discovery interrupted.")\
+\
+        if args.icmp_fallback or len(ips) <= 1024:\
+            known = \{ip for (ip,) in conn.execute("SELECT ip FROM discovered")\}\
+            remaining = [ip for ip in to_check if ip not in known]\
+            if remaining:\
+                _icmp_fallback(remaining, conn)\
+    return \{ip for (ip,) in conn.execute("SELECT ip FROM discovered")\} & set(ips)\
+\
+# ===========================================================================\
+# FULL PORT SCAN\
+# ===========================================================================\
+async def _full_port_scan_async(ip, concurrency, timeout):\
+    open_ports = []; sem = asyncio.Semaphore(concurrency); batch = 2000\
+    async def probe(port):\
+        async with sem:\
+            try:\
+                _, w = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout)\
+                try: w.close()\
+                except Exception: pass\
+                return port\
+            except Exception:\
+                return None\
+    for start in range(1, 65536, batch):\
+        end = min(start + batch, 65536)\
+        results = await asyncio.gather(*[probe(p) for p in range(start, end)])\
+        open_ports.extend(p for p in results if p is not None)\
+    return sorted(open_ports)\
+\
+def _full_scan_masscan(ips, rate):\
+    if not masscan_available():\
+        return None\
+    cmd = ["masscan", "-p", "1-65535", "--rate", str(rate), "-oL", "-",\
+           "--wait", "3"] + ips\
+    try:\
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)\
+    except Exception:\
+        return None\
+    if proc.returncode != 0: return None\
+    found = \{\}\
+    for line in proc.stdout.splitlines():\
+        p = line.split()\
+        if len(p) >= 4 and p[0] == "open":\
+            try:\
+                port = int(p[2]); ip = p[3]\
+            except (ValueError, IndexError):\
+                continue\
+            found.setdefault(ip, []).append(port)\
+    return found\
+\
+def full_port_scan_host(ip, args):\
+    if args.masscan_enabled and masscan_available():\
+        res = _full_scan_masscan([ip], args.masscan_rate)\
+        if res is not None:\
+            return sorted(res.get(ip, []))\
+    try:\
+        return asyncio.run(_full_port_scan_async(ip, args.concurrency, args.timeout))\
+    except Exception as exc:\
+        warn(f"\{ip\}: port scan failed: \{exc\}")\
+        return []\
+\
+# ===========================================================================\
+# SERVICE INSPECTION\
+# ===========================================================================\
+def inspect_open_port(ip, port, timeout):\
+    banner = http_status = server_header = page_title = tls_subject = tls_issuer = ""\
+    http_headers = \{\}\
+    sock = None\
+    try:\
+        raw = socket.create_connection((ip, port), timeout=timeout)\
+        raw.settimeout(timeout)\
+        sock = raw\
+        if port in TLS_PORTS:\
+            ctx = ssl.create_default_context()\
+            ctx.check_hostname = False\
+            ctx.verify_mode = ssl.CERT_NONE\
+            try:\
+                sock = ctx.wrap_socket(raw, server_hostname=ip)\
+                sock.settimeout(timeout)\
+                cert = sock.getpeercert()\
+                if cert:\
+                    subj = dict(x[0] for x in cert.get("subject", []))\
+                    iss = dict(x[0] for x in cert.get("issuer", []))\
+                    tls_subject = subj.get("commonName", "") or subj.get("organizationName", "")\
+                    tls_issuer = iss.get("commonName", "") or iss.get("organizationName", "")\
+            except (ssl.SSLError, OSError, TimeoutError):\
+                raw.close()\
+                return \{"ip": ip, "port": port, "banner": "TLS handshake failed",\
+                        "http_status": "", "server_header": "", "page_title": "",\
+                        "tls_subject": "", "tls_issuer": "", "http_headers": \{\},\
+                        "observed_at": utc_now()\}\
+        if port in HTTP_PORTS or port in HTTPS_PORTS:\
+            req = (f"GET / HTTP/1.0\\r\\nHost: \{ip\}\\r\\n"\
+                   "User-Agent: InventoryScanner/4.0\\r\\nConnection: close\\r\\n\\r\\n").encode()\
+            try:\
+                sock.sendall(req)\
+                chunks, total = [], 0\
+                while total < 8192:\
+                    try: chunk = sock.recv(min(2048, 8192 - total))\
+                    except socket.timeout: break\
+                    if not chunk: break\
+                    chunks.append(chunk); total += len(chunk)\
+                resp = b"".join(chunks)\
+                http_status, server_header, page_title, http_headers = parse_http_response(resp)\
+                first = resp.splitlines()[0] if resp.splitlines() else b""\
+                banner = clean_text(first, 300)\
+            except (OSError, TimeoutError):\
+                banner = "HTTP connected; metadata unavailable"\
+        else:\
+            try: banner = clean_text(sock.recv(1024), 500)\
+            except (socket.timeout, OSError, TimeoutError): banner = ""\
+        return \{"ip": ip, "port": port, "banner": banner,\
+                "http_status": http_status, "server_header": server_header,\
+                "page_title": page_title, "tls_subject": tls_subject,\
+                "tls_issuer": tls_issuer, "http_headers": http_headers,\
+                "observed_at": utc_now()\}\
+    except (ConnectionRefusedError, TimeoutError, OSError):\
+        return None\
+    finally:\
+        if sock is not None:\
+            try: sock.close()\
+            except OSError: pass\
+\
+def is_likely_ephemeral(port, confirmed_name, banner):\
+    if confirmed_name: return False\
+    if not banner or len(banner.strip()) < 3:\
+        return port >= EPHEMERAL_MIN\
+    return False\
+\
+# ===========================================================================\
+# ENRICHMENT MODULES\
+# ===========================================================================\
+def ssdp_discover(timeout=3.0):\
+    """Send SSDP M-SEARCH to multicast 239.255.255.250:1900, collect UPnP devices."""\
+    msg = ('M-SEARCH * HTTP/1.1\\r\\n'\
+           'HOST: 239.255.255.250:1900\\r\\n'\
+           'MAN: "ssdp:discover"\\r\\n'\
+           'MX: 3\\r\\n'\
+           'ST: ssdp:all\\r\\n\\r\\n').encode()\
+    devices = []\
+    try:\
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\
+        s.settimeout(timeout)\
+        s.sendto(msg, ("239.255.255.250", 1900))\
+        end = time.time() + timeout\
+        seen = set()\
+        while time.time() < end:\
+            try:\
+                data, addr = s.recvfrom(2048)\
+            except socket.timeout:\
+                break\
+            ip = addr[0]\
+            if ip in seen: continue\
+            seen.add(ip)\
+            text = data.decode("utf-8", errors="replace")\
+            server = re.search(r"^SERVER:\\s*(.+)$", text, re.I | re.M)\
+            location = re.search(r"^LOCATION:\\s*(.+)$", text, re.I | re.M)\
+            st = re.search(r"^ST:\\s*(.+)$", text, re.I | re.M)\
+            devices.append(\{\
+                "ip": ip,\
+                "server": server.group(1).strip() if server else "",\
+                "location": location.group(1).strip() if location else "",\
+                "st": st.group(1).strip() if st else "",\
+            \})\
+        s.close()\
+    except Exception as exc:\
+        warn(f"SSDP failed: \{exc\}")\
+    return devices\
+\
+def mdns_discover(timeout=3.0):\
+    """Query mDNS for _services._dns-sd._udp.local (multicast)."""\
+    # Minimal DNS query for PTR _services._dns-sd._udp.local\
+    header = b"\\x00\\x00\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00"\
+    qname = (b"\\x09_services\\x07_dns-sd\\x04_udp\\x05local\\x00")\
+    qtype = b"\\x00\\x0c\\x00\\x01"  # PTR IN\
+    packet = header + qname + qtype\
+    services = []\
+    try:\
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\
+        s.settimeout(timeout)\
+        s.sendto(packet, ("224.0.0.251", 5353))\
+        end = time.time() + timeout\
+        seen = set()\
+        while time.time() < end:\
+            try:\
+                data, addr = s.recvfrom(2048)\
+            except socket.timeout:\
+                break\
+            ip = addr[0]\
+            if ip in seen: continue\
+            seen.add(ip)\
+            # Extract readable strings from response (best-effort)\
+            strings = re.findall(rb"[\\x20-\\x7e]\{4,\}", data)\
+            services.append(\{"ip": ip, "strings": [s.decode("ascii") for s in strings[:8]]\})\
+        s.close()\
+    except Exception as exc:\
+        warn(f"mDNS failed: \{exc\}")\
+    return services\
+\
+def snmp_probe(ip, timeout=1.5):\
+    """Try SNMPv1 GET sysDescr with common community strings."""\
+    # Pre-built BER-encoded SNMPv1 GET sysDescr.0\
+    def _packet(community: bytes) -> bytes:\
+        req_id = b"\\x02\\x01\\x01"\
+        get_sysdescr = b"\\x30\\x0b\\x30\\x09\\x06\\x05\\x2b\\x06\\x01\\x02\\x01\\x01\\x01\\x05\\x00"\
+        pdu = b"\\xa0" + bytes([len(req_id) + len(get_sysdescr) + 6]) + req_id + b"\\x02\\x01\\x00\\x02\\x01\\x00" + get_sysdescr\
+        varbind = b"\\x04" + bytes([len(community)]) + community + pdu\
+        total_len = len(varbind)\
+        header = b"\\x30" + (bytes([total_len]) if total_len < 128 else b"\\x81" + bytes([total_len]))\
+        return header + varbind\
+    for community in (b"public", b"private"):\
+        try:\
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\
+            s.settimeout(timeout)\
+            s.sendto(_packet(community), (ip, 161))\
+            data, _ = s.recvfrom(2048); s.close()\
+            if data and len(data) > 20:\
+                # Extract printable sysDescr from response\
+                txt = clean_text(data, 200)\
+                return \{"community": community.decode(), "response": txt[:120]\}\
+        except Exception:\
+            continue\
+    return None\
+\
+def ntp_check(ip, timeout=1.5):\
+    """NTP mode 3 (client) request \'97 indicates potential amplification if answered."""\
+    try:\
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\
+        s.settimeout(timeout)\
+        s.sendto(b"\\x1b" + b"\\x00" * 47, (ip, 123))\
+        data, _ = s.recvfrom(1024); s.close()\
+        if len(data) >= 48:\
+            return \{"response_len": len(data),\
+                    "amplification_risk": "YES (mode6 monlist)" if len(data) > 400 else "low"\}\
+    except Exception:\
+        pass\
+    return None\
+\
+def dns_recursion_check(ip, timeout=1.5):\
+    """Query a third-party name (example.com) \'97 recursion check."""\
+    try:\
+        # Minimal DNS A query for example.com\
+        pkt = (b"\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00"\
+               b"\\x07example\\x03com\\x00\\x00\\x01\\x00\\x01")\
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\
+        s.settimeout(timeout)\
+        s.sendto(pkt, (ip, 53))\
+        data, _ = s.recvfrom(1024); s.close()\
+        if len(data) > 20 and data[3] & 0x0F == 0:  # NOERROR\
+            return \{"recursive": True\}\
+    except Exception:\
+        pass\
+    return \{"recursive": False\}\
+\
+def tls_analysis(ip, port, timeout=2.0):\
+    """Check supported TLS versions and weak ciphers."""\
+    result = \{"supported_versions": [], "weak_ciphers": []\}\
+    versions = [\
+        ("TLSv1.0", ssl.TLSVersion.TLSv1),\
+        ("TLSv1.1", ssl.TLSVersion.TLSv1_1),\
+        ("TLSv1.2", ssl.TLSVersion.TLSv1_2),\
+        ("TLSv1.3", ssl.TLSVersion.TLSv1_3),\
+    ]\
+    for label, ver in versions:\
+        try:\
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)\
+            ctx.check_hostname = False\
+            ctx.verify_mode = ssl.CERT_NONE\
+            ctx.minimum_version = ver\
+            ctx.maximum_version = ver\
+            with socket.create_connection((ip, port), timeout=timeout) as raw:\
+                with ctx.wrap_socket(raw, server_hostname=ip) as s:\
+                    result["supported_versions"].append(label)\
+        except Exception:\
+            pass\
+    # Weak cipher check (RC4, 3DES, DES)\
+    for name in ("RC4-SHA", "DES-CBC3-SHA"):\
+        try:\
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)\
+            ctx.check_hostname = False\
+            ctx.verify_mode = ssl.CERT_NONE\
+            ctx.set_ciphers(name)\
+            with socket.create_connection((ip, port), timeout=timeout) as raw:\
+                with ctx.wrap_socket(raw, server_hostname=ip):\
+                    result["weak_ciphers"].append(name)\
+        except Exception:\
+            pass\
+    return result\
+\
+def http_options_probe(ip, port, timeout=2.0):\
+    """Send OPTIONS / to enumerate supported methods."""\
+    try:\
+        conn = http.client.HTTPConnection(ip, port, timeout=timeout)\
+        conn.request("OPTIONS", "/")\
+        r = conn.getresponse()\
+        allow = r.getheader("Allow") or r.getheader("allow") or ""\
+        conn.close()\
+        return \{"allow": allow.strip()\}\
+    except Exception:\
+        return \{"allow": ""\}\
+\
+def http_security_headers(headers: dict):\
+    """Return which security headers are missing."""\
+    wanted = ["strict-transport-security", "content-security-policy",\
+              "x-frame-options", "x-content-type-options", "referrer-policy"]\
+    missing = [h for h in wanted if h not in headers]\
+    return \{"missing": missing, "present": [h for h in wanted if h in headers]\}\
+\
+def traceroute_to(ip, max_hops=15, timeout=1.0):\
+    """Simple traceroute using system binary."""\
+    tr = shutil.which("traceroute")\
+    if not tr:\
+        return []\
+    try:\
+        proc = subprocess.run(\
+            [tr, "-n", "-m", str(max_hops), "-w", str(int(timeout)), ip],\
+            capture_output=True, text=True, timeout=max_hops * timeout + 5,\
+        )\
+        hops = []\
+        for line in proc.stdout.splitlines():\
+            m = re.match(r"\\s*(\\d+)\\s+(\\S+)", line)\
+            if m:\
+                hops.append(\{"hop": int(m.group(1)), "addr": m.group(2)\})\
+        return hops\
+    except Exception:\
+        return []\
+\
+def smb_null_session(ip, timeout=3):\
+    """Check if SMB allows null session (impacket)."""\
+    if not HAVE_IMPACKET:\
+        return None\
+    try:\
+        conn = SMBConnection(ip, ip, sess_port=445, timeout=timeout)\
+        conn.login("", "")  # null session\
+        shares = conn.listShares()\
+        conn.logoff()\
+        return \{"null_session": True, "shares": [s["shi1_netname"][:-1] for s in shares]\}\
+    except Exception as exc:\
+        return \{"null_session": False, "error": str(exc)[:100]\}\
+\
+# ===========================================================================\
+# DEVICE IDENTIFICATION\
+# ===========================================================================\
+def identify_iot(ports):\
+    matches = []\
+    for name, sig in IOT_FINGERPRINTS.items():\
+        overlap = len(ports & sig)\
+        if overlap >= 2:\
+            matches.append((name, overlap))\
+    matches.sort(key=lambda x: -x[1])\
+    return (matches[0][0], matches[0][1]) if matches else ("", 0)\
+\
+def identify_device(services, confirmed_map, ping_ok):\
+    confirmed_names = \{confirmed_map[p][0] for p in confirmed_map if confirmed_map[p][0]\}\
+    ports = \{s["port"] for s in services\}\
+    evidence = [f"\{s['port']\}/\{confirmed_map.get(s['port'], ('', ''))[0] or PORT_GUESS.get(s['port'], '?')\}: \{(s.get('banner') or '')[:80]\}"\
+                for s in services]\
+\
+    iot_name, iot_score = identify_iot(ports)\
+    if iot_name and iot_score >= 2:\
+        return f"\{iot_name\} (fingerprint: \{iot_score\} ports)", " | ".join(evidence)\
+\
+    if "JetDirect-printer" in confirmed_names or 631 in ports:\
+        kind = "Printer / print service"\
+    elif "RTSP" in confirmed_names or 554 in ports:\
+        kind = "RTSP device (camera/DVR)"\
+    elif 3389 in ports:\
+        kind = "Host with RDP (Windows)"\
+    elif ports & \{445, 139\}:\
+        kind = "SMB/NetBIOS host"\
+    elif "MQTT" in confirmed_names:\
+        kind = "MQTT/IoT"\
+    elif "VNC" in confirmed_names:\
+        kind = "Host with VNC"\
+    elif any(db in confirmed_names for db in ("MySQL", "PostgreSQL", "MongoDB", "Redis", "MS-SQL")):\
+        kind = "DB/storage server"\
+    elif confirmed_names & \{"HTTP", "HTTP/2", "HTTPS"\}:\
+        kind = "Web server / web UI"\
+    elif "SSH" in confirmed_names or "SSH/OpenSSH" in confirmed_names:\
+        kind = "SSH host (Unix/Linux)"\
+    elif ports:\
+        kind = "Host with open TCP services"\
+    elif ping_ok:\
+        kind = "Ping-only host"\
+    else:\
+        kind = "No response"\
+    return kind, " | ".join(evidence)\
+\
+# ===========================================================================\
+# BRUTE-FORCE\
+# ===========================================================================\
+DEFAULT_CREDENTIALS = \{\
+    "ssh": [("root","root"),("root","admin"),("root","123456"),\
+            ("admin","admin"),("admin","password"),("admin","1234"),\
+            ("pi","raspberry"),("ubnt","ubnt"),("root",""),("admin","")],\
+    "telnet": [("admin","admin"),("root","root"),("root","vizxv"),\
+               ("root","xc3511"),("root","Zte521"),("root","5up"),\
+               ("guest","guest"),("ubnt","ubnt")],\
+    "ftp": [("anonymous","anonymous"),("ftp","ftp"),("admin","admin"),\
+            ("root","root"),("user","123456")],\
+    "mysql": [("root",""),("root","root"),("root","mysql"),\
+              ("root","123456"),("mysql","mysql")],\
+    "postgresql": [("postgres","postgres"),("postgres",""),("postgres","admin")],\
+    "redis": [("","")],\
+    "mongodb": [("admin","admin"),("admin",""),("root","root")],\
+    "http": [("admin","admin"),("admin","password"),("admin","1234"),\
+             ("root","root"),("admin",""),("administrator","admin"),\
+             ("admin","changeme")],\
+\}\
+PORT_TO_PROTOCOL = \{22:"ssh",23:"telnet",21:"ftp",3306:"mysql",\
+                    5432:"postgresql",6379:"redis",27017:"mongodb"\}\
+\
+def try_http_login(ip, port, timeout, max_attempts):\
+    def _probe(auth):\
+        try:\
+            conn = http.client.HTTPConnection(ip, port, timeout=timeout)\
+            h = \{"User-Agent": "InventoryScanner/4.0"\}\
+            if auth: h["Authorization"] = auth\
+            conn.request("GET", "/", headers=h)\
+            r = conn.getresponse(); body = r.read(4096)\
+            hdrs = \{k.lower(): v for k, v in r.getheaders()\}\
+            st = r.status; conn.close()\
+            return st, hdrs, body\
+        except Exception:\
+            return -1, \{\}, b""\
+    anon_st, anon_h, anon_b = _probe(None)\
+    if anon_st not in (200, 401, 403):\
+        return []\
+    needs_auth = anon_st in (401, 403)\
+    has_form = b"<form" in anon_b.lower() and b"password" in anon_b.lower()\
+    if not needs_auth and not has_form:\
+        return []\
+    for user, pwd in DEFAULT_CREDENTIALS["http"][:max_attempts]:\
+        token = base64.b64encode(f"\{user\}:\{pwd\}".encode()).decode()\
+        st, h, body = _probe(f"Basic \{token\}")\
+        if needs_auth and st == 200:\
+            return [(user, pwd)]\
+        if not needs_auth and st in (200, 302, 303):\
+            if "set-cookie" in h and "set-cookie" not in anon_h:\
+                return [(user, pwd)]\
+            if st in (302, 303) and any(x in h.get("location", "").lower()\
+                                         for x in ("dashboard","index","home")):\
+                return [(user, pwd)]\
+            if b"<form" not in body.lower() and b"password" not in body.lower():\
+                return [(user, pwd)]\
+    return []\
+\
+def try_ssh(ip, port, timeout, max_attempts):\
+    if not HAVE_SSH: return []\
+    for user, pwd in DEFAULT_CREDENTIALS["ssh"][:max_attempts]:\
+        c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())\
+        try:\
+            c.connect(ip, port=port, username=user, password=pwd, timeout=timeout,\
+                      allow_agent=False, look_for_keys=False)\
+            c.close(); return [(user, pwd)]\
+        except Exception:\
+            continue\
+    return []\
+\
+def try_telnet(ip, port, timeout, max_attempts):\
+    if not HAVE_TELNET: return []\
+    for user, pwd in DEFAULT_CREDENTIALS["telnet"][:max_attempts]:\
+        try:\
+            tn = telnetlib.Telnet(ip, port, timeout=timeout)\
+            tn.read_until(b"login:", timeout=timeout); tn.write(user.encode()+b"\\n")\
+            tn.read_until(b"Password:", timeout=timeout); tn.write(pwd.encode()+b"\\n")\
+            r = tn.read_some(); tn.close()\
+            if b"incorrect" not in r.lower() and b"failed" not in r.lower():\
+                return [(user, pwd)]\
+        except Exception:\
+            continue\
+    return []\
+\
+def try_ftp(ip, port, timeout, max_attempts):\
+    if not HAVE_FTP: return []\
+    for user, pwd in DEFAULT_CREDENTIALS["ftp"][:max_attempts]:\
+        try:\
+            f = ftplib.FTP(); f.connect(ip, port, timeout=timeout)\
+            f.login(user, pwd); f.quit(); return [(user, pwd)]\
+        except Exception:\
+            continue\
+    return []\
+\
+def try_mysql(ip, port, timeout, max_attempts):\
+    if not HAVE_MYSQL: return []\
+    for user, pwd in DEFAULT_CREDENTIALS["mysql"][:max_attempts]:\
+        try:\
+            c = pymysql.connect(host=ip, port=port, user=user, password=pwd,\
+                                connect_timeout=max(1, int(timeout)))\
+            c.close(); return [(user, pwd)]\
+        except Exception:\
+            continue\
+    return []\
+\
+def try_postgresql(ip, port, timeout, max_attempts):\
+    if not HAVE_PG: return []\
+    for user, pwd in DEFAULT_CREDENTIALS["postgresql"][:max_attempts]:\
+        try:\
+            c = psycopg2.connect(host=ip, port=port, user=user, password=pwd,\
+                                 connect_timeout=max(1, int(timeout)))\
+            c.close(); return [(user, pwd)]\
+        except Exception:\
+            continue\
+    return []\
+\
+def try_redis(ip, port, timeout, max_attempts):\
+    if not HAVE_REDIS: return []\
+    for user, pwd in DEFAULT_CREDENTIALS["redis"][:max_attempts]:\
+        try:\
+            r = redis.Redis(host=ip, port=port, password=pwd or None,\
+                            socket_connect_timeout=timeout, socket_timeout=timeout)\
+            r.ping(); return [(user, pwd)]\
+        except Exception:\
+            continue\
+    return []\
+\
+def try_mongodb(ip, port, timeout, max_attempts):\
+    if not HAVE_MONGO: return []\
+    for user, pwd in DEFAULT_CREDENTIALS["mongodb"][:max_attempts]:\
+        try:\
+            c = pymongo.MongoClient(ip, port, username=user, password=pwd,\
+                                    authSource="admin",\
+                                    serverSelectionTimeoutMS=max(500, int(timeout*1000)))\
+            c.admin.command("ping"); c.close(); return [(user, pwd)]\
+        except Exception:\
+            continue\
+    return []\
+\
+CRED_CHECKERS = \{"ssh":try_ssh,"telnet":try_telnet,"ftp":try_ftp,\
+                 "mysql":try_mysql,"postgresql":try_postgresql,\
+                 "redis":try_redis,"mongodb":try_mongodb,"http":try_http_login\}\
+\
+def try_credentials(ip, port, protocol, timeout, max_attempts):\
+    fn = CRED_CHECKERS.get(protocol)\
+    if not fn: return []\
+    try: return fn(ip, port, timeout, max_attempts)\
+    except Exception: return []\
+\
+# ===========================================================================\
+# HOST REPORT\
+# ===========================================================================\
+def print_host_report(ip, services, confirmed_map, hostname, netbios, os_hint,\
+                      ping_ok, rtt, ttl, enrichment):\
+    real = []; ephemeral = []\
+    for s in services:\
+        name = confirmed_map.get(s["port"], ("", ""))[0]\
+        if is_likely_ephemeral(s["port"], name, s.get("banner", "")):\
+            ephemeral.append(s["port"])\
+        else:\
+            real.append(s)\
+\
+    cprint(f"\\n\uc0\u9556 \{'\u9552 '*78\}\u9559 ", C.CYAN)\
+    cprint(f"\uc0\u9553  \{C.BOLD\}HOST \{ip:<15\}\{C.RESET\}\{C.CYAN\}  \{(hostname or '(no PTR)'):<30\}", C.CYAN)\
+    cprint(f"\uc0\u9568 \{'\u9552 '*78\}\u9571 ", C.CYAN)\
+\
+    meta = [f"ping=\{'UP' if ping_ok else 'DOWN'\}"]\
+    if rtt is not None: meta.append(f"rtt=\{rtt:.1f\}ms")\
+    if ttl is not None: meta.append(f"ttl=\{ttl\}")\
+    if os_hint: meta.append(f"os~\{os_hint\}")\
+    if netbios: meta.append(f"netbios=\{netbios\}")\
+    if enrichment.get("mac"): meta.append(f"mac=\{enrichment['mac']\}")\
+    cprint(f"\uc0\u9553  \{' \'b7 '.join(meta):<76\} \u9553 ", C.DIM, dim=True)\
+\
+    if not real:\
+        cprint(f"\uc0\u9553  \{'(no identified TCP services)':<76\} \u9553 ", C.AMBER, dim=True)\
+    else:\
+        cprint(f"\uc0\u9567 \{'\u9472 '*78\}\u9570 ", C.CYAN)\
+        cprint(f"\uc0\u9553  \{'PORT':<7\} \{'CONFIRMED':<22\} \{'GUESS':<14\} \{'BANNER':<30\} \u9553 ", C.CYAN, bold=True)\
+        cprint(f"\uc0\u9567 \{'\u9472 '*78\}\u9570 ", C.CYAN)\
+        for s in real:\
+            port = s["port"]\
+            banner = (s.get("banner") or "")[:30]\
+            confirmed = confirmed_map.get(port, ("", ""))[0]\
+            guess = PORT_GUESS.get(port, "?")\
+            col = C.GREEN if confirmed else C.AMBER\
+            cprint(f"\uc0\u9553  \{port:<7\} \{confirmed or '\'97':<22\} \{guess:<14\} \{banner:<30\} \u9553 ",\
+                   col, dim=not confirmed)\
+\
+    if ephemeral:\
+        cprint(f"\uc0\u9567 \{'\u9472 '*78\}\u9570 ", C.DIM)\
+        ep_str = ",".join(str(p) for p in ephemeral)\
+        cprint(f"\uc0\u9553  \{'ephemeral (ignored): ' + ep_str:<76\} \u9553 ", C.DIM, dim=True)\
+\
+    # Enrichment details\
+    extra = []\
+    if enrichment.get("ssdp"):\
+        extra.append(f"UPnP: \{enrichment['ssdp'].get('server', '?')\}")\
+    if enrichment.get("mdns"):\
+        extra.append(f"mDNS: \{len(enrichment['mdns'])\} responders")\
+    if enrichment.get("snmp"):\
+        extra.append(f"SNMP: community='\{enrichment['snmp']['community']\}'")\
+    if enrichment.get("ntp"):\
+        extra.append(f"NTP: amp=\{enrichment['ntp']['amplification_risk']\}")\
+    if enrichment.get("dns"):\
+        extra.append(f"DNS recursion: \{'YES' if enrichment['dns']['recursive'] else 'no'\}")\
+    if enrichment.get("tls"):\
+        v = enrichment["tls"].get("supported_versions", [])\
+        w = enrichment["tls"].get("weak_ciphers", [])\
+        if v: extra.append(f"TLS: \{'/'.join(v)\}")\
+        if w: extra.append(f"weak ciphers: \{','.join(w)\}")\
+    if enrichment.get("http_security", \{\}).get("missing"):\
+        extra.append(f"missing headers: \{len(enrichment['http_security']['missing'])\}")\
+    if enrichment.get("http_options", \{\}).get("allow"):\
+        extra.append(f"OPTIONS Allow: \{enrichment['http_options']['allow']\}")\
+    if enrichment.get("smb"):\
+        smb = enrichment["smb"]\
+        if smb and smb.get("null_session"):\
+            extra.append(f"SMB null session: YES, shares=\{smb.get('shares', [])\}")\
+    if enrichment.get("cves"):\
+        extra.append(f"CVE hints: \{len(enrichment['cves'])\}")\
+    if enrichment.get("traceroute"):\
+        extra.append(f"traceroute: \{len(enrichment['traceroute'])\} hops")\
+\
+    if extra:\
+        cprint(f"\uc0\u9567 \{'\u9472 '*78\}\u9570 ", C.CYAN)\
+        for line in extra:\
+            cprint(f"\uc0\u9553  \{line:<76\} \u9553 ", C.MAGENTA)\
+\
+    cprint(f"\uc0\u9562 \{'\u9552 '*78\}\u9565 ", C.CYAN)\
+\
+# ===========================================================================\
+# FULL PIPELINE PER HOST\
+# ===========================================================================\
+def scan_host_full(ip, args, conn, global_enrich):\
+    frame(f"HOST \{ip\}", C.GREEN)\
+    t0 = time.time()\
+\
+    # 1. Port scan\
+    if args.quick_ports:\
+        scan_ports = QUICK_PORTS\
+        status(f"quick scan (\{len(scan_ports)\} ports)", C.DIM)\
+    elif args.ports:\
+        scan_ports = args.ports\
+        status(f"custom scan (\{len(scan_ports)\} ports)", C.DIM)\
+    else:\
+        scan_ports = None\
+        status("FULL scan 1-65535", C.DIM)\
+\
+    if scan_ports is not None:\
+        sem = asyncio.Semaphore(args.concurrency)\
+        async def _run():\
+            async def probe(p):\
+                async with sem:\
+                    try:\
+                        _, w = await asyncio.wait_for(\
+                            asyncio.open_connection(ip, p), timeout=args.timeout)\
+                        try: w.close()\
+                        except Exception: pass\
+                        return p\
+                    except Exception:\
+                        return None\
+            return [p for p in await asyncio.gather(*[probe(p) for p in scan_ports])\
+                    if p is not None]\
+        try:\
+            open_ports = sorted(asyncio.run(_run()))\
+        except Exception as exc:\
+            warn(f"\{ip\}: async scan failed: \{exc\}")\
+            open_ports = []\
+    else:\
+        open_ports = full_port_scan_host(ip, args)\
+\
+    elapsed = time.time() - t0\
+    status(f"\{len(open_ports)\} open ports in \{elapsed:.1f\}s", C.GREEN)\
+\
+    # 2. Service inspection + confirmation\
+    services = []\
+    confirmed_map = \{\}\
+    for port in open_ports:\
+        svc = inspect_open_port(ip, port, args.timeout)\
+        if svc is None or not svc.get("banner"):\
+            time.sleep(0.1)\
+            retry = inspect_open_port(ip, port, min(args.timeout * 2, 2.0))\
+            if retry: svc = retry\
+        if svc:\
+            services.append(svc)\
+            name, desc = confirm_service(port, svc.get("banner", ""))\
+            confirmed_map[port] = (name, desc)\
+\
+    # 3. Basic discovery info\
+    ping_ok, rtt, ttl = ping_host(ip)\
+    hostname, _ = reverse_hostname(ip)\
+    netbios = try_netbios(ip) if (ping_ok or any(p in (139,137,445) for p in open_ports)) else ""\
+    os_hint = os_hint_from_ttl(ttl)\
+\
+    # 4. Enrichment\
+    enrichment = \{\
+        "mac": arp_lookup(ip) if ping_ok else "",\
+        "cves": [],\
+        "http_headers": \{\},\
+        "traceroute": [],\
+    \}\
+\
+    if not args.no_enrich:\
+        # CVE hints from banners\
+        all_banners = " ".join(s.get("banner", "") or "" for s in services)\
+        enrichment["cves"] = cve_hints_for(all_banners)\
+\
+        # SSDP per-host mapping (from global cache)\
+        ssdp_for_ip = [d for d in global_enrich.get("ssdp", []) if d["ip"] == ip]\
+        if ssdp_for_ip:\
+            enrichment["ssdp"] = ssdp_for_ip[0]\
+\
+        mdns_for_ip = [d for d in global_enrich.get("mdns", []) if d["ip"] == ip]\
+        if mdns_for_ip:\
+            enrichment["mdns"] = mdns_for_ip[0]\
+\
+        # SNMP\
+        if 161 in open_ports or (ping_ok and not open_ports):\
+            r = snmp_probe(ip)\
+            if r: enrichment["snmp"] = r\
+\
+        # NTP\
+        if 123 in open_ports:\
+            r = ntp_check(ip)\
+            if r: enrichment["ntp"] = r\
+\
+        # DNS recursion\
+        if 53 in open_ports:\
+            enrichment["dns"] = dns_recursion_check(ip)\
+\
+        # TLS scan on first HTTPS-like port\
+        for p in open_ports:\
+            if p in TLS_PORTS:\
+                enrichment["tls"] = tls_analysis(ip, p, timeout=min(args.timeout * 3, 3.0))\
+                break\
+\
+        # HTTP headers/options on first HTTP port\
+        http_port = next((p for p in open_ports if p in HTTP_PORTS), None)\
+        if http_port:\
+            enrichment["http_security"] = http_security_headers(\
+                next((s["http_headers"] for s in services if s["port"] == http_port), \{\}))\
+            enrichment["http_options"] = http_options_probe(ip, http_port)\
+\
+        # SMB null session\
+        if 445 in open_ports and HAVE_IMPACKET:\
+            r = smb_null_session(ip)\
+            if r: enrichment["smb"] = r\
+\
+        # Traceroute (optional, can be slow)\
+        if args.traceroute and ping_ok:\
+            enrichment["traceroute"] = traceroute_to(ip)\
+\
+    # 5. Report\
+    print_host_report(ip, services, confirmed_map, hostname, netbios, os_hint,\
+                      ping_ok, rtt, ttl, enrichment)\
+\
+    # 6. Save\
+    device_type, evidence = identify_device(services, confirmed_map, ping_ok)\
+    save_host(conn, \{\
+        "ip": ip, "hostname": hostname, "netbios_name": netbios,\
+        "ptr_valid": 1 if hostname else 0, "os_hint": os_hint,\
+        "mac": enrichment.get("mac", ""),\
+        "ping_ok": int(ping_ok), "rtt_ms": rtt,\
+        "distance_km": estimate_distance_km(rtt),\
+        "device_type": device_type, "evidence": evidence,\
+        "open_ports": ",".join(str(p) for p in open_ports),\
+        "scanned_at": utc_now(), "services": services,\
+        "confirmed_services": confirmed_map,\
+        "scanned_with_bruteforce": 1 if args.bruteforce else 0,\
+    \})\
+    save_enrichment(conn, ip, enrichment)\
+\
+    # 7. Brute-force\
+    if args.bruteforce:\
+        with conn:\
+            conn.execute("DELETE FROM credentials_found WHERE ip = ?", (ip,))\
+        creds = []\
+        for svc in services:\
+            port = svc["port"]\
+            confirmed_name = confirmed_map.get(port, ("", ""))[0]\
+            protocol = PORT_TO_PROTOCOL.get(port)\
+            if protocol is None and confirmed_name in ("HTTP","HTTP/2","HTTPS"):\
+                protocol = "http"\
+            if protocol and confirmed_name:\
+                status(f"brute \{port\}/\{protocol\} (\{confirmed_name\})", C.MAGENTA)\
+                for user, pwd in try_credentials(ip, port, protocol,\
+                                                 args.timeout, args.max_cred_attempts):\
+                    creds.append(\{\
+                        "ip": ip, "port": port, "protocol": protocol,\
+                        "username": user, "password": pwd,\
+                        "device_type": device_type,\
+                        "banner": svc.get("banner", ""),\
+                        "found_at": utc_now(),\
+                    \})\
+                    cprint(f"  [!] FOUND \{user\}:\{pwd\} on \{port\}/\{protocol\}",\
+                           C.RED, bold=True)\
+        save_credentials(conn, creds)\
+\
+    return \{"ip": ip, "open_ports": open_ports,\
+            "confirmed": confirmed_map, "device_type": device_type,\
+            "enrichment": enrichment\}\
+\
+# ===========================================================================\
+# DB / CSV / JSON\
+# ===========================================================================\
+def init_db(conn):\
+    conn.executescript("""\
+        PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;\
+        CREATE TABLE IF NOT EXISTS hosts (\
+            ip TEXT PRIMARY KEY, hostname TEXT DEFAULT '',\
+            netbios_name TEXT DEFAULT '', mac TEXT DEFAULT '',\
+            ptr_valid INTEGER DEFAULT 0, os_hint TEXT DEFAULT '',\
+            ping_ok INTEGER DEFAULT 0, rtt_ms REAL, distance_km REAL,\
+            device_type TEXT DEFAULT '', evidence TEXT DEFAULT '',\
+            open_ports TEXT DEFAULT '', scanned_at TEXT NOT NULL,\
+            scan_status TEXT DEFAULT 'complete',\
+            scanned_with_bruteforce INTEGER DEFAULT 0\
+        );\
+        CREATE TABLE IF NOT EXISTS services (\
+            ip TEXT NOT NULL, port INTEGER NOT NULL,\
+            service TEXT DEFAULT '', confirmed_service TEXT DEFAULT '',\
+            confirmation_desc TEXT DEFAULT '', banner TEXT DEFAULT '',\
+            http_status TEXT DEFAULT '', server_header TEXT DEFAULT '',\
+            page_title TEXT DEFAULT '', tls_subject TEXT DEFAULT '',\
+            tls_issuer TEXT DEFAULT '', observed_at TEXT NOT NULL,\
+            PRIMARY KEY (ip, port),\
+            FOREIGN KEY (ip) REFERENCES hosts(ip) ON DELETE CASCADE\
+        );\
+        CREATE TABLE IF NOT EXISTS discovered (\
+            ip TEXT PRIMARY KEY, beacon_port INTEGER, method TEXT DEFAULT 'tcp',\
+            rtt_ms REAL, discovered_at TEXT NOT NULL\
+        );\
+        CREATE TABLE IF NOT EXISTS enrichment (\
+            ip TEXT PRIMARY KEY, data TEXT NOT NULL,\
+            updated_at TEXT NOT NULL\
+        );\
+        CREATE TABLE IF NOT EXISTS credentials_found (\
+            ip TEXT NOT NULL, port INTEGER NOT NULL, protocol TEXT NOT NULL,\
+            username TEXT NOT NULL, password TEXT NOT NULL,\
+            device_type TEXT DEFAULT '', banner TEXT DEFAULT '',\
+            found_at TEXT NOT NULL,\
+            PRIMARY KEY (ip, port, protocol, username, password)\
+        );\
+    """)\
+    conn.commit()\
+    _migrate(conn, "hosts", [\
+        ("netbios_name","TEXT DEFAULT ''"),("mac","TEXT DEFAULT ''"),\
+        ("ptr_valid","INTEGER DEFAULT 0"),("os_hint","TEXT DEFAULT ''"),\
+        ("distance_km","REAL"),("scanned_with_bruteforce","INTEGER DEFAULT 0"),\
+    ])\
+    _migrate(conn, "services", [\
+        ("confirmed_service","TEXT DEFAULT ''"),\
+        ("confirmation_desc","TEXT DEFAULT ''"),\
+        ("tls_subject","TEXT DEFAULT ''"),("tls_issuer","TEXT DEFAULT ''"),\
+    ])\
+    conn.commit()\
+\
+def _migrate(conn, table, cols):\
+    existing = \{r[1] for r in conn.execute(f"PRAGMA table_info(\{table\})")\}\
+    for n, d in cols:\
+        if n not in existing:\
+            try: conn.execute(f"ALTER TABLE \{table\} ADD COLUMN \{n\} \{d\}")\
+            except sqlite3.OperationalError: pass\
+\
+def save_discovered(conn, ip, port, method, rtt=None):\
+    with conn:\
+        conn.execute("""INSERT OR REPLACE INTO discovered\
+            (ip, beacon_port, method, rtt_ms, discovered_at)\
+            VALUES (?,?,?,?,?)""", (ip, port, method, rtt, utc_now()))\
+\
+def save_enrichment(conn, ip, data):\
+    with conn:\
+        conn.execute("""INSERT OR REPLACE INTO enrichment (ip, data, updated_at)\
+                        VALUES (?,?,?)""",\
+                     (ip, json.dumps(data, default=str), utc_now()))\
+\
+def save_host(conn, r):\
+    bf = r.get("scanned_with_bruteforce", 0)\
+    conn.execute("BEGIN")\
+    try:\
+        conn.execute("DELETE FROM services WHERE ip=?", (r["ip"],))\
+        conn.execute("""INSERT INTO hosts\
+            (ip, hostname, netbios_name, mac, ptr_valid, os_hint, ping_ok,\
+             rtt_ms, distance_km, device_type, evidence, open_ports,\
+             scanned_at, scan_status, scanned_with_bruteforce)\
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'complete', ?)\
+            ON CONFLICT(ip) DO UPDATE SET\
+              hostname=excluded.hostname, netbios_name=excluded.netbios_name,\
+              mac=excluded.mac, ptr_valid=excluded.ptr_valid,\
+              os_hint=excluded.os_hint, ping_ok=excluded.ping_ok,\
+              rtt_ms=excluded.rtt_ms, distance_km=excluded.distance_km,\
+              device_type=excluded.device_type, evidence=excluded.evidence,\
+              open_ports=excluded.open_ports, scanned_at=excluded.scanned_at,\
+              scanned_with_bruteforce=excluded.scanned_with_bruteforce""",\
+            (r["ip"], r["hostname"], r["netbios_name"], r.get("mac",""),\
+             r["ptr_valid"], r["os_hint"], r["ping_ok"], r["rtt_ms"],\
+             r["distance_km"], r["device_type"], r["evidence"],\
+             r["open_ports"], r["scanned_at"], bf))\
+        for s in r["services"]:\
+            name, desc = r.get("confirmed_services", \{\}).get(s["port"], ("", ""))\
+            conn.execute("""INSERT OR REPLACE INTO services\
+                (ip, port, service, confirmed_service, confirmation_desc,\
+                 banner, http_status, server_header, page_title,\
+                 tls_subject, tls_issuer, observed_at)\
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",\
+                (s["ip"], s["port"], PORT_GUESS.get(s["port"], ""), name, desc,\
+                 s["banner"], s["http_status"], s["server_header"],\
+                 s["page_title"], s.get("tls_subject",""), s.get("tls_issuer",""),\
+                 s["observed_at"]))\
+        conn.commit()\
+    except Exception:\
+        conn.rollback(); raise\
+\
+def save_credentials(conn, creds):\
+    if not creds: return\
+    with conn:\
+        conn.executemany("""INSERT OR REPLACE INTO credentials_found\
+            (ip, port, protocol, username, password, device_type, banner, found_at)\
+            VALUES (?,?,?,?,?,?,?,?)""",\
+            [(c["ip"], c["port"], c["protocol"], c["username"], c["password"],\
+              c["device_type"], c["banner"], c["found_at"]) for c in creds])\
+\
+def _atomic_write(path, content):\
+    tmp = path.with_suffix(path.suffix + ".tmp")\
+    with tmp.open("w", encoding="utf-8-sig") as f:\
+        f.write(content)\
+    os.replace(tmp, path)\
+\
+def _csv_str(header, rows):\
+    import io\
+    buf = io.StringIO()\
+    w = csv.writer(buf); w.writerow(header); w.writerows(rows)\
+    return buf.getvalue()\
+\
+def export_all(conn):\
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)\
+\
+    _atomic_write(DISCOVERED_CSV, _csv_str(\
+        ["ip","beacon_port","method","rtt_ms","discovered_at"],\
+        conn.execute("SELECT ip,beacon_port,method,rtt_ms,discovered_at "\
+                     "FROM discovered ORDER BY ip")))\
+\
+    _atomic_write(HOSTS_CSV, _csv_str(\
+        ["ip","hostname","netbios_name","mac","ptr_valid","os_hint","ping_ok",\
+         "rtt_ms","distance_km","device_type","open_ports","evidence","scanned_at"],\
+        conn.execute("""SELECT ip,hostname,netbios_name,mac,ptr_valid,os_hint,\
+                               ping_ok,rtt_ms,distance_km,device_type,\
+                               open_ports,evidence,scanned_at\
+                        FROM hosts WHERE ping_ok=1 OR open_ports!=''\
+                        ORDER BY ip""")))\
+\
+    _atomic_write(CREDS_CSV, _csv_str(\
+        ["ip","port","protocol","username","password","device_type","banner","found_at"],\
+        conn.execute("""SELECT ip,port,protocol,username,password,\
+                               device_type,banner,found_at\
+                        FROM credentials_found ORDER BY ip,port""")))\
+\
+    _atomic_write(ENRICH_CSV, _csv_str(\
+        ["ip","data","updated_at"],\
+        conn.execute("SELECT ip, data, updated_at FROM enrichment ORDER BY ip")))\
+\
+    # JSON export\
+    hosts_json = []\
+    for row in conn.execute("""SELECT ip,hostname,netbios_name,mac,ptr_valid,\
+                                      os_hint,ping_ok,rtt_ms,distance_km,\
+                                      device_type,open_ports,evidence,scanned_at\
+                               FROM hosts WHERE ping_ok=1 OR open_ports!=''\
+                               ORDER BY ip"""):\
+        host = dict(zip(["ip","hostname","netbios_name","mac","ptr_valid",\
+                         "os_hint","ping_ok","rtt_ms","distance_km",\
+                         "device_type","open_ports","evidence","scanned_at"], row))\
+        host["services"] = []\
+        for svc_row in conn.execute(\
+            """SELECT port,service,confirmed_service,banner,http_status,\
+                      server_header,page_title,tls_subject,tls_issuer\
+               FROM services WHERE ip=? ORDER BY port""", (row[0],)):\
+            host["services"].append(dict(zip(\
+                ["port","service","confirmed_service","banner","http_status",\
+                 "server_header","page_title","tls_subject","tls_issuer"], svc_row)))\
+        enr = conn.execute("SELECT data FROM enrichment WHERE ip=?", (row[0],)).fetchone()\
+        host["enrichment"] = json.loads(enr[0]) if enr else \{\}\
+        hosts_json.append(host)\
+\
+    creds_json = [dict(zip(\
+        ["ip","port","protocol","username","password","device_type","banner","found_at"], row))\
+        for row in conn.execute("""SELECT ip,port,protocol,username,password,\
+                                          device_type,banner,found_at\
+                                   FROM credentials_found ORDER BY ip,port""")]\
+\
+    _atomic_write(RESULTS_JSON, json.dumps(\
+        \{"hosts": hosts_json, "credentials": creds_json\},\
+        indent=2, ensure_ascii=False, default=str))\
+\
+# ===========================================================================\
+# TARGET PARSING\
+# ===========================================================================\
+def download_country_cidrs(codes):\
+    nets = []\
+    for reg, url in RIR_URLS.items():\
+        status(f"Downloading \{reg.upper()\} delegated", C.DIM)\
+        try:\
+            with urllib.request.urlopen(url, timeout=120) as resp:\
+                text = resp.read().decode("utf-8", errors="replace")\
+        except Exception as exc:\
+            warn(f"\{reg\}: \{exc\}"); continue\
+        for line in text.splitlines():\
+            line = line.strip()\
+            if not line or line.startswith("#"): continue\
+            p = line.split("|")\
+            if len(p) < 7: continue\
+            _, cc, rtype, start, value, _d, st = p[:7]\
+            if rtype != "ipv4" or st not in ("allocated","assigned"): continue\
+            if cc.upper() not in codes: continue\
+            try:\
+                s = ipaddress.IPv4Address(start); c = int(value)\
+                e = ipaddress.IPv4Address(int(s)+c-1)\
+                nets.extend(ipaddress.summarize_address_range(s, e))\
+            except Exception: continue\
+    return list(ipaddress.collapse_addresses(nets))\
+\
+def parse_targets(args):\
+    entries, sources = [], []\
+    if args.cidr: entries.extend(args.cidr); sources.append("cli")\
+    if args.targets:\
+        tf = Path(args.targets).expanduser()\
+        if not tf.is_file(): raise ValueError(f"File not found: \{tf\}")\
+        for line in tf.read_text(encoding="utf-8").splitlines():\
+            line = line.split("#",1)[0].strip()\
+            if line: entries.append(line)\
+        sources.append(f"file:\{tf\}")\
+    if args.countries:\
+        for n in download_country_cidrs(\{c.upper() for c in args.countries\}):\
+            entries.append(str(n))\
+        sources.append(f"countries:\{','.join(args.countries)\}")\
+    if not entries: raise ValueError("Specify --cidr, --targets, or --countries.")\
+    nets = []\
+    for e in entries:\
+        try: n = ipaddress.ip_network(e, strict=False)\
+        except ValueError as exc: raise ValueError(f"Invalid '\{e\}': \{exc\}") from exc\
+        if not isinstance(n, ipaddress.IPv4Network):\
+            raise ValueError(f"IPv4 only: \{e\}")\
+        nets.append(n)\
+    return list(ipaddress.collapse_addresses(nets)), "; ".join(sources)\
+\
+def enumerate_targets(nets, max_hosts):\
+    est = sum(n.num_addresses if n.prefixlen>=31 else max(0,n.num_addresses-2) for n in nets)\
+    if est > max_hosts: raise ValueError(f"Too many addresses (\{est\}); limit \{max_hosts\}.")\
+    ips = set()\
+    for n in nets: ips.update(str(x) for x in n.hosts())\
+    if len(ips) > max_hosts: raise ValueError(f"\{len(ips)\} addresses; limit \{max_hosts\}.")\
+    return sorted(ips, key=lambda x: int(ipaddress.ip_address(x)))\
+\
+def parse_ports(value):\
+    ports = set()\
+    for part in value.split(","):\
+        part = part.strip()\
+        if not part: continue\
+        try: p = int(part)\
+        except ValueError as exc: raise argparse.ArgumentTypeError(f"Not a port: \{part\}") from exc\
+        if not 1 <= p <= 65535: raise argparse.ArgumentTypeError(f"Out of range: \{p\}")\
+        ports.add(p)\
+    if not ports: raise argparse.ArgumentTypeError("At least one port required")\
+    return sorted(ports)\
+\
+# ===========================================================================\
+# ENV CHECK\
+# ===========================================================================\
+def check_env(bruteforce):\
+    mods = \{"paramiko":HAVE_SSH,"ftplib":HAVE_FTP,"telnetlib":HAVE_TELNET,\
+            "pymysql":HAVE_MYSQL,"psycopg2":HAVE_PG,"redis":HAVE_REDIS,\
+            "pymongo":HAVE_MONGO,"impacket":HAVE_IMPACKET\}\
+    missing = [n for n,ok in mods.items() if not ok]\
+    masscan_ok = masscan_available()\
+    root = os.geteuid() == 0\
+    status(f"masscan: \{'ENABLED' if masscan_ok else ('available but not root' if shutil.which('masscan') else 'not installed')\}", C.DIM)\
+    status(f"root: \{'YES' if root else 'no'\}", C.DIM)\
+    if missing:\
+        warn(f"missing modules: \{', '.join(missing)\}")\
+        warn("install: python3 -m venv ~/scan-venv && source ~/scan-venv/bin/activate "\
+             "&& pip install paramiko pymysql psycopg2-binary redis pymongo impacket")\
+    if bruteforce:\
+        attempted = [p for p,ok in mods.items() if ok and p not in ("impacket",)] + ["http"]\
+        if not attempted: return 3\
+        status(f"bruteforce: \{', '.join(attempted)\}", C.MAGENTA)\
+    return 0\
+\
+# ===========================================================================\
+# MAIN\
+# ===========================================================================\
+def main():\
+    parser = argparse.ArgumentParser(\
+        description="Full-pipeline IPv4 scanner. masscan is used automatically "\
+                    "when available AND root; otherwise falls back to asyncio.")\
+    tg = parser.add_mutually_exclusive_group(required=True)\
+    tg.add_argument("--cidr", action="append")\
+    tg.add_argument("--targets")\
+    tg.add_argument("--countries", nargs="+", metavar="CC")\
+\
+    # Discovery\
+    parser.add_argument("--beacon-ports", type=parse_ports,\
+                        default=TCP_BEACON_DEFAULT,\
+                        help="TCP beacon ports for discovery")\
+    parser.add_argument("--udp-beacon-ports", type=parse_ports,\
+                        default=UDP_BEACON_DEFAULT,\
+                        help="UDP beacon ports (only used with masscan)")\
+    parser.add_argument("--concurrency", type=int, default=1000)\
+    parser.add_argument("--icmp-fallback", action="store_true")\
+    parser.add_argument("--no-masscan", action="store_true",\
+                        help="Disable masscan even if available")\
+    parser.add_argument("--masscan-rate", type=int, default=10000)\
+\
+    # Scan\
+    parser.add_argument("--ports", type=parse_ports, default=None,\
+                        help="Custom port list (default: ALL 1-65535)")\
+    parser.add_argument("--quick-ports", action="store_true")\
+\
+    # Brute-force\
+    parser.add_argument("--bruteforce", action="store_true")\
+    parser.add_argument("--max-cred-attempts", type=int, default=5)\
+\
+    # Enrichment\
+    parser.add_argument("--no-enrich", action="store_true",\
+                        help="Skip SSDP/mDNS/SNMP/TLS/HTTP checks")\
+    parser.add_argument("--traceroute", action="store_true",\
+                        help="Include traceroute per host (slow)")\
+\
+    # General\
+    parser.add_argument("--timeout", type=float, default=0.4)\
+    parser.add_argument("--threads", type=int, default=24)\
+    parser.add_argument("--max-hosts", type=int, default=65536)\
+    parser.add_argument("--rescan", action="store_true")\
+    args = parser.parse_args()\
+\
+    if not 1 <= args.threads <= 64: parser.error("--threads 1\'9664")\
+    if not 0.1 <= args.timeout <= 3.0: parser.error("--timeout 0.1\'963.0")\
+    if not 1 <= args.max_hosts <= 16_777_216: parser.error("--max-hosts 1\'9616777216")\
+    if args.max_cred_attempts < 1: parser.error("--max-cred-attempts >= 1")\
+\
+    # internal: masscan_enabled = True unless --no-masscan given\
+    args.masscan_enabled = not args.no_masscan\
+\
+    banner()\
+    rc = check_env(args.bruteforce)\
+    if rc != 0: return rc\
+\
+    try:\
+        networks, source = parse_targets(args)\
+        all_ips = enumerate_targets(networks, args.max_hosts)\
+    except ValueError as exc:\
+        error(str(exc)); return 2\
+\
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)\
+    conn = sqlite3.connect(DB_PATH, timeout=30)\
+    try:\
+        init_db(conn); export_all(conn)\
+\
+        if args.rescan:\
+            conn.execute("DELETE FROM discovered")\
+            conn.execute("DELETE FROM hosts")\
+            conn.execute("DELETE FROM credentials_found")\
+            conn.execute("DELETE FROM enrichment")\
+            conn.commit()\
+            warn("--rescan: progress cleared")\
+\
+        frame("CONFIGURATION", C.AMBER)\
+        status(f"networks: \{', '.join(str(n) for n in networks)\}")\
+        status(f"addresses: \{len(all_ips)\}; source: \{source\}")\
+        status(f"port scan: \{'quick' if args.quick_ports else (args.ports or 'FULL 1-65535')\}")\
+        status(f"masscan: \{'enabled' if args.masscan_enabled else 'disabled'\}")\
+        status(f"enrichment: \{'OFF' if args.no_enrich else 'ON (SSDP/mDNS/SNMP/TLS/HTTP/SMB)'\}")\
+        status(f"bruteforce: \{'ON (after scan)' if args.bruteforce else 'OFF'\}")\
+\
+        # Pre-discovery enrichment: SSDP + mDNS (once for whole network)\
+        global_enrich = \{"ssdp": [], "mdns": []\}\
+        if not args.no_enrich:\
+            status("Global SSDP/mDNS discovery", C.CYAN)\
+            global_enrich["ssdp"] = ssdp_discover(timeout=3.0)\
+            global_enrich["mdns"] = mdns_discover(timeout=3.0)\
+            status(f"SSDP responders: \{len(global_enrich['ssdp'])\}; "\
+                   f"mDNS responders: \{len(global_enrich['mdns'])\}", C.DIM)\
+\
+        scanned_ips = set()\
+        t_start = time.time()\
+\
+        round1 = discovery_pass(all_ips, networks, args, conn, "ROUND 1")\
+        status(f"Round 1: \{len(round1)\} alive", C.GREEN)\
+        if round1:\
+            frame(f"ROUND 1: FULL SCAN (\{len(round1)\} hosts)", C.AMBER)\
+            for ip in sorted(round1, key=lambda x: int(ipaddress.ip_address(x))):\
+                try:\
+                    scan_host_full(ip, args, conn, global_enrich)\
+                    scanned_ips.add(ip); export_all(conn)\
+                except Exception as exc:\
+                    error(f"\{ip\}: \{exc\}")\
+\
+        round2 = discovery_pass(all_ips, networks, args, conn, "ROUND 2")\
+        new_hosts = round2 - round1\
+        if new_hosts:\
+            frame(f"ROUND 2: \{len(new_hosts)\} NEW HOSTS", C.GREEN)\
+            for ip in sorted(new_hosts, key=lambda x: int(ipaddress.ip_address(x))):\
+                try:\
+                    scan_host_full(ip, args, conn, global_enrich)\
+                    scanned_ips.add(ip); export_all(conn)\
+                except Exception as exc:\
+                    error(f"\{ip\}: \{exc\}")\
+            round3 = discovery_pass(all_ips, networks, args, conn, "ROUND 3")\
+            newest = round3 - round2\
+            if newest:\
+                warn(f"Round 3: \{len(newest)\} MORE appeared: \{sorted(newest)\}")\
+                for ip in sorted(newest, key=lambda x: int(ipaddress.ip_address(x))):\
+                    try:\
+                        scan_host_full(ip, args, conn, global_enrich)\
+                        scanned_ips.add(ip); export_all(conn)\
+                    except Exception as exc:\
+                        error(f"\{ip\}: \{exc\}")\
+            else:\
+                status("Round 3: network stable", C.GREEN)\
+        else:\
+            status("Round 2: no new hosts", C.GREEN)\
+\
+        export_all(conn)\
+        elapsed = time.time() - t_start\
+\
+        frame("SCAN COMPLETE", C.GREEN)\
+        status(f"elapsed: \{elapsed:.1f\}s")\
+        status(f"hosts scanned: \{len(scanned_ips)\}")\
+        total_confirmed = conn.execute(\
+            "SELECT COUNT(*) FROM services WHERE confirmed_service != ''").fetchone()[0]\
+        total_creds = conn.execute("SELECT COUNT(*) FROM credentials_found").fetchone()[0]\
+        total_cves = 0\
+        for (data,) in conn.execute("SELECT data FROM enrichment"):\
+            try:\
+                total_cves += len(json.loads(data).get("cves", []))\
+            except Exception:\
+                pass\
+        status(f"confirmed services: \{total_confirmed\}", C.CYAN)\
+        status(f"CVE hints: \{total_cves\}", C.AMBER if total_cves else C.DIM)\
+        status(f"credentials found: \{total_creds\}",\
+               C.RED if total_creds else C.DIM)\
+        cprint(f"\\n  CSV: \{DISCOVERED_CSV\}", C.DIM)\
+        cprint(f"       \{HOSTS_CSV\}", C.DIM)\
+        cprint(f"       \{CREDS_CSV\}", C.DIM)\
+        cprint(f"       \{ENRICH_CSV\}", C.DIM)\
+        cprint(f"  JSON: \{RESULTS_JSON\}", C.DIM)\
+        cprint(f"  DB: \{DB_PATH\}\\n", C.DIM)\
+        return 0\
+    finally:\
+        conn.close()\
+\
+if __name__ == "__main__":\
+    try:\
+        sys.exit(main())\
+    except KeyboardInterrupt:\
+        cprint("\\n[!] Interrupted \'97 progress saved in SQLite.", C.AMBER)\
+        sys.exit(130)}

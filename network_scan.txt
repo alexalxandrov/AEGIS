@@ -1,0 +1,2 @@
+Host: 127.0.0.1 (localhost)	Status: Up
+Host: 127.0.0.1 (localhost)	Ports: 5000/open/tcp//rtsp///, 7000/open/tcp//rtsp///, 9993/open/tcp//palace-2?///, 11434/open/tcp//http//Golang net|http server/, 49162/open/tcp//bandwidth-test//MikroTik bandwidth-test server/, 49242/open/tcp//unknown///, 49347/open/tcp//http//Node.js Express framework/, 54967/filtered/tcp/////	Ignored State: closed (65527)

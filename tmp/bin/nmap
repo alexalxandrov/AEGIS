@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Dummy `nmap` binary used for unit‑test style execution.
+
+It reads a list of ``host:port`` lines from stdin and outputs a very small
+XML fragment that mimics the structure produced by the real ``nmap`` tool.
+Only the fields required by :func:`aegis.tentacles.network_scan.scan_subnet`
+are emitted – ``<host>`` with ``<address>``, ``<port>``, ``<state>`` and
+``<service>``.
+"""
+
+import sys
+import xml.etree.ElementTree as ET
+
+def main():
+    lines = sys.stdin.read().strip().splitlines()
+    root = ET.Element("nmaprun")
+    for line in lines:
+        if not line:
+            continue
+        try:
+            ip, port = line.split(":")
+            port = int(port)
+        except ValueError:
+            continue
+        host_el = ET.SubElement(root, "host")
+        addr_el = ET.SubElement(host_el, "address", attrib={"addrtype": "ipv4", "addr": ip})
+        ports_el = ET.SubElement(host_el, "ports")
+        port_el = ET.SubElement(ports_el, "port", attrib={"protocol": "tcp", "portid": str(port)})
+        state_el = ET.SubElement(port_el, "state", attrib={"state": "open"})
+        service_el = ET.SubElement(port_el, "service", attrib={"name": "http"})
+    tree = ET.ElementTree(root)
+    ET.indent(tree, space="  ")  # Python 3.9+ indentation helper
+    tree.write(sys.stdout, encoding="unicode", xml_declaration=False)
+
+
+if __name__ == "__main__":
+    main()

@@ -55,6 +55,16 @@ REGISTRY: List[Dict] = [
         "url": "https://viewdns.info",
         "key": "API_KEY",
     }
+    ,
+    {
+        "name": "Wayback",
+        "category": "archive",
+        "mode": "passive",
+        "requires_key": 0,
+        "check": "archive",
+        "url": "https://web.archive.org",
+        "key": "",
+    }
 ]
 
 
