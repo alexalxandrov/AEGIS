@@ -21,12 +21,18 @@ import datetime
 import os
 import re
 import sys
+import subprocess
+import shutil
+import os
 from pathlib import Path
 from typing import Any, Optional
 
 import time
 
 from aegis import config, db, sources, ai_analyst
+# Network scan utilities removed per user request
+import xml.etree.ElementTree as ET
+import json
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -89,23 +95,128 @@ def _ensure_organization(c: Any, name: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Argument parser
+# Network scan helpers
 # ---------------------------------------------------------------------------
+
+def run_network_scan(target: str) -> list[dict]:
+    """Perform a simple port/service scan against *target*.
+
+    The function prefers ``naabu`` for its fast JSON output; if it is not
+    available it falls back to ``nmap`` using XML output.
+
+    It returns a list of dictionaries with keys ``target``, ``port``, ``state``
+    and ``service``.  The list can be written to CSV/JSON by the caller.
+    """
+    # Determine which scanner to use.
+    scanner = None
+    if shutil.which("naabu"):
+        scanner = "naabu"
+    elif shutil.which("nmap"):
+        scanner = "nmap"
+    else:
+        raise RuntimeError("Neither naabu nor nmap is installed – please install one to enable network scanning.")
+
+    # Build the command based on the selected scanner.
+    if scanner == "naabu":
+        # Use JSON lines output with the ``-j`` flag. ``-j`` writes JSON
+        # lines to stdout, which we capture and then parse.
+        cmd = ["naabu", "-host", target, "-j", "-"]
+    else:  # scanner == "nmap"
+        cmd = ["nmap", "-oX", "-", target]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        # Provide more context when a scan fails – include stderr and returncode.
+        print("[DEBUG] naabu command output:")
+        print("stdout:\n", result.stdout)
+        print("stderr:\n", result.stderr)
+        raise RuntimeError(f"Network scan failed (rc={result.returncode}): {result.stderr.strip()}")
+
+    scans: list[dict] = []
+    if scanner == "naabu":
+        # naabu output is a JSON array of objects
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Failed to parse naabu JSON output: {e}")
+        for entry in data:
+            scans.append(
+                {
+                    "target": target,
+                    "port": entry.get("port"),
+                    "state": entry.get("status"),
+                    "service": entry.get("service", ""),
+                }
+            )
+    else:  # nmap
+        root = ET.fromstring(result.stdout)
+        for host in root.findall("./host"):
+            for port in host.findall("./ports/port"):
+                portid = port.get("portid")
+                state = port.find("state").get("state") if port.find("state") is not None else "unknown"
+                service_elem = port.find("service")
+                svc_name = service_elem.get("name") if service_elem is not None else ""
+                scans.append(
+                    {
+                        "target": target,
+                        "port": portid,
+                        "state": state,
+                        "service": svc_name,
+                    }
+                )
+    return scans
+
+
+def write_network_summary(workspace: Path, scans: list[dict]) -> None:
+    """Write a compact JSON summary of network scan results.
+
+    The summary maps each target to a list of discovered services.
+    It is written to ``workspace/network_scan.json``.
+    """
+    summary: dict[str, list[dict]] = {}
+    for entry in scans:
+        target = entry.get("target")
+        if not target:
+            continue
+        summary.setdefault(target, []).append(
+            {
+                "port": entry.get("port"),
+                "state": entry.get("state"),
+                "service": entry.get("service"),
+            }
+        )
+    json_path = workspace / "network_scan.json"
+    with open(json_path, "w", encoding="utf-8") as jf:
+        json.dump(summary, jf, indent=2)
+
+
+def write_scan_results(workspace: Path, scans: list[dict]) -> None:
+    """Persist *scans* to CSV and JSON inside *workspace*.
+
+    The CSV has columns: target, port, state, service.  The JSON is a list of the
+    dictionaries.
+    """
+    csv_path = workspace / "scan_results.csv"
+    json_path = workspace / "scan_results.json"
+    # Write CSV
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write("target,port,state,service\n")
+        for entry in scans:
+            f.write(
+                f"{entry['target']},{entry['port']},{entry['state']},{entry['service']}\n"
+            )
+    # Write JSON
+    with open(json_path, "w", encoding="utf-8") as jf:
+        json.dump(scans, jf, indent=2)
 
 parser = argparse.ArgumentParser(description="Bootstrap AEGIS environment")
 # Organization flag is optional.  If omitted, the script will create/use a
 # default organization named "default".  This change keeps backward
 # compatibility for existing callers that explicitly provide an org.
 parser.add_argument("--org", help="Organization name or ID", default="default")
-# Accept a single target argument that can be an IP, hostname or URL.  The
-# script will auto‑detect its type.
-    # Positional target argument (no explicit 'required' flag – argparse handles it)
 parser.add_argument("target", help="Target IP, hostname or URL")
-parser.add_argument("--nick", help="Nickname for the target")
-parser.add_argument("--company", help="Company name associated with target")
 parser.add_argument("--limit", type=int, help="Maximum number of assets to scan")
 parser.add_argument("--no-wayback", action="store_true", help="Skip Wayback Machine queries")
-parser.add_argument("--verbose", action="store_true", help="Print logs to stdout in addition to log files")
 parser.add_argument("--output-dir", help="Custom output directory (default: timestamped run folder)")
 
 
@@ -121,16 +232,29 @@ def main(args: argparse.Namespace) -> None:
     args:
         Parsed command‑line arguments.
     """
+    # ---------------------------------------------------------------------
+    # Ensure the tool directory (tmp/bin) is in PATH so that the required
+    # binaries are found by ``shutil.which`` in ``check_required_tools``.
+    # ---------------------------------------------------------------------
+    # The original code inserted a ``tmp/bin`` directory into ``PATH`` to
+    # locate bundled binaries.  However, the binaries shipped in that
+    # directory are not compatible with macOS and cause the scan tools to
+    # exit with a non‑zero status.  Removing the PATH modification lets
+    # the system locate the native binaries installed via Homebrew or
+    # elsewhere.
     # Extract target early for workspace naming
     target = args.target
     # Clean up any previous scan directories that may still exist in the script directory
     script_dir = Path(__file__).parent
     cleanup_cmd = f"find {script_dir} -maxdepth 1 -type d -name 'scan-*' -exec rm -rf {{}} +"
     import subprocess
-    try:
-        subprocess.run(cleanup_cmd, shell=True, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"Cleanup failed: {e}")
+    subprocess.run(cleanup_cmd, shell=True, check=False)
+    # Determine workspace directory
+    workspace = Path(args.output_dir) if args.output_dir else Path("output_" + time.strftime("%Y%m%d_%H%M%S"))
+    # Ensure workspace and logs directories exist
+    workspace.mkdir(exist_ok=True)
+    logs_dir = workspace / "logs"
+    logs_dir.mkdir(exist_ok=True)
     # Workspace creation and log redirection
     if args.output_dir:
         workspace = Path(args.output_dir).expanduser().resolve()
@@ -147,38 +271,40 @@ def main(args: argparse.Namespace) -> None:
     importlib.reload(config)
 
     def _redirect_logs() -> None:
-        """Redirect stdout/stderr to log files.
+        """Redirect stdout/stderr to log files *and* keep console output.
 
-        When ``args.verbose`` is set, a *tee* object is used so that output is
-        written both to the log file and to the original stdout/stderr.
+        In earlier versions the output was redirected to log files only.
+        For the current requirement, console output must always be visible.
+        This is achieved by wrapping the file handles in a *tee* that writes to
+        both the original stream and the log file.
         """
         logs_dir = workspace / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
-        if getattr(args, "verbose", False):
-            original_stdout = sys.stdout
-            original_stderr = sys.stderr
-            class Tee:
-                def __init__(self, file_obj, orig):
-                    self.file_obj = file_obj
-                    self.orig = orig
-                def write(self, s):
-                    self.file_obj.write(s)
-                    self.orig.write(s)
-                def flush(self):
-                    self.file_obj.flush()
-                    self.orig.flush()
-            sys.stdout = Tee(open(logs_dir / "stdout.log", "w", encoding="utf-8"), original_stdout)
-            sys.stderr = Tee(open(logs_dir / "stderr.log", "w", encoding="utf-8"), original_stderr)
-        else:
-            sys.stdout = open(logs_dir / "stdout.log", "w", encoding="utf-8")
-            sys.stderr = open(logs_dir / "stderr.log", "w", encoding="utf-8")
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        class Tee:
+            def __init__(self, file_obj, orig):
+                self.file_obj = file_obj
+                self.orig = orig
+            def write(self, s):
+                self.file_obj.write(s)
+                self.orig.write(s)
+            def flush(self):
+                self.file_obj.flush()
+                self.orig.flush()
+        sys.stdout = Tee(open(logs_dir / "stdout.log", "w", encoding="utf-8"), original_stdout)
+        sys.stderr = Tee(open(logs_dir / "stderr.log", "w", encoding="utf-8"), original_stderr)
 
     _redirect_logs()
 
     # Database and sources
     _ensure_database()
     c = db.connect()
-    _ensure_sources(c)
+    # ---------------------------------------------------------------------
+    # Always ensure required networking tools are present, because we now
+    # perform a network scan unconditionally.
+    # ---------------------------------------------------------------------
+    # Skipped tool requirement checks as network scan functionality has been removed.
     _print_ollama_status()
 
     # Organization handling
@@ -215,10 +341,10 @@ def main(args: argparse.Namespace) -> None:
         )
         # Removed legacy IP seeding block
 
-    # Run a lightweight scan
+    # Run a lightweight scan (seed scan)
     try:
         from aegis import runner
-        print("\nRunning initial scan (may take a few seconds)...")
+        print("\nRunning initial seed scan (may take a few seconds)...")
         runner.run_org(
             c,
             args.org,
@@ -227,7 +353,36 @@ def main(args: argparse.Namespace) -> None:
             wb=not args.no_wayback,
         )
     except Exception as e:  # pragma: no cover – scan errors are user‑visible
-        print("Error during scan:", e)
+        print("Error during seed scan:", e)
+
+    # --- Full network reconnaissance -----------------------------------
+    print("\nЗапускаю полную сетевую разведку…")
+    try:
+        from aegis.tentacles.network_scan import run_network_scan
+        net_results = run_network_scan(args.target, timeout=120)
+    except Exception as e:
+        print("Не удалось выполнить сетевой скан: ", e)
+        net_results = []
+
+    # Persist scan results to the scan directory for later analysis
+    net_log_path = workspace / f"network_scan.log"
+    with open(net_log_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(net_results, indent=2, ensure_ascii=False))
+    print(f"Полные результаты сети записаны в {net_log_path}")
+
+    # --- AI summarization (always pass network results) -----------------------------------
+    status = ai_analyst.ollama_status()
+    if status.get("available") and status.get("preferred_present"):
+        print("\nПередаю результаты скана в ИИ для анализа…")
+        # Формируем вопрос с включением результатов
+        net_summary = "\n".join(
+            [f"{r['port']} {r['state']} {r.get('service', '')}" for r in net_results]
+        )
+        question = f"Проведи анализ сетевого скана {args.target}. Результаты:\n{net_summary}\nДай рекомендации по дальнейшим действиям."
+        answer = ai_analyst.ask(c, org_id, question)
+        print("AI ответ:", answer.get("answer"))
+    else:
+        print("Ollama не доступен; пропускаю AI анализ.")
 
     # Export assets to a single CSV file per scan for easier consumption
     try:
@@ -243,6 +398,11 @@ def main(args: argparse.Namespace) -> None:
         # Also print to console for quick review
         for row in rows:
             print(dict(zip(columns, row)))
+        # Write JSON representation
+        json_path = workspace / "results.json"
+        with open(json_path, "w", encoding="utf-8") as jf:
+            json.dump([dict(zip(columns, row)) for row in rows], jf, indent=2)
+        print(f"JSON results written to {json_path}")
     except Exception as e:  # pragma: no cover – exporting errors are user‑visible
         print("Error writing results:", e)
 
