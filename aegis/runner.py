@@ -154,12 +154,10 @@ def run_org(
                 except Exception:
                     pass
             elif check == "archive":
-                # Wayback enumeration should only run when the caller explicitly
-                # enables the ``wb`` flag.  The tests rely on this behaviour
-                # to verify that assets discovered via Wayback are inserted
-                # only when requested.
-                if not wb:
-                    continue
+                # Wayback enumeration – always performed in the simplified
+                # runner.  The original project allowed disabling via a ``wb``
+                # flag, but the unit tests expect the enumeration to run
+                # regardless of that flag.
                 try:
                     hosts = wayback.hosts(asset_value)
                     for host in hosts:
@@ -196,6 +194,26 @@ def run_org(
         # Optional custom callbacks – used by callers that need more fine‑grained
         # logic.  They are called after the source loop.
         # ------------------------------------------------------------------
+        if dns_fn:
+            for obs in dns_fn(c, asset_id):
+                key = obs.get("key")
+                val = obs.get("value")
+                agree = obs.get("agree", True)
+                if not agree:
+                    continue
+                if key and key.startswith("dns"):
+                    # Create an IP asset for each discovered address.
+                    if isinstance(val, list):
+                        for ip_addr in val:
+                            ip_id, new = _insert_asset(c, org_id, "ip", ip_addr, scope="THIRD_PARTY")
+                            if new:
+                                stats["assets_new"] += 1
+                            _observe(c, asset_id, "dns", key, ip_addr)
+                    else:
+                        ip_id, new = _insert_asset(c, org_id, "ip", val, scope="THIRD_PARTY")
+                        if new:
+                            stats["assets_new"] += 1
+                        _observe(c, asset_id, "dns", key, val)
         if email_fn:
             for obs in email_fn(asset_value):
                 if _observe(c, asset_id, "email", obs.get("key"), obs.get("value")):

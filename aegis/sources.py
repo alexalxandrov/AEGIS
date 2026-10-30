@@ -65,6 +65,26 @@ REGISTRY: List[Dict] = [
         "url": "https://web.archive.org",
         "key": "",
     }
+    ,
+    {
+        "name": "EmailCheck",
+        "category": "email",
+        "mode": "passive",
+        "requires_key": 0,
+        "check": "email",
+        "url": "https://mailchecker.example",
+        "key": "",
+    }
+    ,
+    {
+        "name": "Probe",
+        "category": "probe",
+        "mode": "active",
+        "requires_key": 0,
+        "check": "probe",
+        "url": "",
+        "key": "",
+    }
 ]
 
 

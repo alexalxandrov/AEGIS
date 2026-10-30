@@ -418,6 +418,23 @@ def main(args: argparse.Namespace) -> None:
     # The original quick‑summary block is omitted to avoid duplicate AI calls.
 
     print("\nDone.")
+    # ---------------------------------------------------------------------------
+    # Automatically launch the FastAPI web server after the starter finishes.
+    # ---------------------------------------------------------------------------
+    # The server is useful for local debugging and mirrors the behaviour of the
+    # legacy `aegis serve` command.  Importing `uvicorn` and `create_app` is
+    # wrapped in a try/except so that the starter can still be imported in
+    # test environments where those optional dependencies may be missing.
+    try:
+        from aegis.api import create_app
+        import uvicorn
+
+        app = create_app()
+        # Default host/port are the same as the CLI serve command.
+        print("\nStarting local API server on http://0.0.0.0:8000")
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    except Exception as exc:  # pragma: no cover - guard against missing deps
+        print("Could not start web server: {}".format(exc))
 
 
 if __name__ == "__main__":

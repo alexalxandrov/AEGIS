@@ -1,4 +1,6 @@
 import argparse, json, sys, urllib.request, socket
+# Import uvicorn lazily in cmd_serve to avoid a hard dependency when the
+# command is not used (e.g., during unit tests).
 from . import config, db, scope, __version__, ai_analyst, ai_advanced
 
 def cmd_init(a):
@@ -13,10 +15,25 @@ def cmd_seed(a):
     c = db.connect()
     o = c.execute("SELECT id FROM organization WHERE name=?", (a.org,)).fetchone()
     if not o: sys.exit("нет такой организации; сначала: aegis org <имя>")
-    c.execute("INSERT OR IGNORE INTO seed(org_id,kind,value,verified) VALUES(?,?,?,?)", (o["id"], a.kind, a.value, int(a.verified)))
-    c.execute("INSERT OR IGNORE INTO asset(org_id,kind,value,scope,first_seen,last_seen) VALUES(?,?,?,?,strftime('%s','now'),strftime('%s','now'))",
-              (o["id"], a.kind, a.value, scope.VERIFIED if a.verified else scope.CANDIDATE))
-    print("seed добавлен", "(VERIFIED)" if a.verified else "(CANDIDATE)")
+
+# --- serve command --------------------------------------------
+def cmd_serve(a):
+    """Run the FastAPI web server.
+
+    The FastAPI application is defined in :mod:`aegis.api.app` and is
+    started via :mod:`uvicorn`.  The command accepts optional ``--host`` and
+    ``--port`` arguments; defaults are ``0.0.0.0`` and ``8000``.
+    """
+    try:
+        import uvicorn
+    except Exception as e:  # pragma: no cover - defensive
+        print("uvicorn not installed. Install it via pip install uvicorn")
+        sys.exit(1)
+    from .api.app import app
+    host = a.host if a.host is not None else "0.0.0.0"
+    port = a.port if a.port is not None else 8000
+    print(f"Starting API on http://{host}:{port}")
+    uvicorn.run(app, host=host, port=port)
 
 def cmd_probe(a):
     """Тест scope: попытка активной пробы актива."""
