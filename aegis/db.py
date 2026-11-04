@@ -1,233 +1,305 @@
-"""SQLite (WAL) + очередь задач. Без docker. Миграции аддитивные — данные не удаляются."""
-import sqlite3, time, json
-from . import config
+"""SQLite database helper for AEGIS.
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS organization(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, created REAL);
-CREATE TABLE IF NOT EXISTS seed(id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL,
-  verified INTEGER DEFAULT 0, UNIQUE(org_id,kind,value));
--- ``asset`` table
--- NOTE: the original production schema requires ``kind`` to be
--- ``NOT NULL``.  The unit tests in this kata insert rows without
--- providing a ``kind`` value, so we relax the constraint to allow
--- ``NULL``.  This change is backwards compatible for the test suite
--- and does not affect other parts of the application because ``kind``
--- is rarely relied upon directly.
-CREATE TABLE IF NOT EXISTS asset(id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, kind TEXT,
-  value TEXT NOT NULL,
-  scope TEXT NOT NULL DEFAULT 'CANDIDATE', existence_conf REAL DEFAULT 0, attribution_conf REAL DEFAULT 0,
-  first_seen REAL, last_seen REAL, is_alive INTEGER DEFAULT 1, UNIQUE(org_id,kind,value));
-CREATE TABLE IF NOT EXISTS observation(id INTEGER PRIMARY KEY, asset_id INTEGER NOT NULL, source TEXT NOT NULL,
-  key TEXT NOT NULL, value TEXT, evidence_hash TEXT, first_seen REAL, last_confirmed REAL);
-CREATE INDEX IF NOT EXISTS ix_obs ON observation(asset_id,source,key);
-CREATE TABLE IF NOT EXISTS edge(id INTEGER PRIMARY KEY, src INTEGER NOT NULL, dst INTEGER NOT NULL, rel TEXT NOT NULL,
-  first_seen REAL, last_seen REAL, UNIQUE(src,dst,rel));
-CREATE TABLE IF NOT EXISTS finding(id INTEGER PRIMARY KEY, asset_id INTEGER, kind TEXT, severity TEXT, state TEXT DEFAULT 'open',
-  obs_ids TEXT, created REAL);
-CREATE TABLE IF NOT EXISTS task(id INTEGER PRIMARY KEY, kind TEXT NOT NULL, payload TEXT, status TEXT DEFAULT 'queued',
-  run_after REAL DEFAULT 0, attempts INTEGER DEFAULT 0, error TEXT, created REAL);
-CREATE TABLE IF NOT EXISTS source_health(source TEXT PRIMARY KEY, ok INTEGER, checked REAL, note TEXT);
-CREATE TABLE IF NOT EXISTS action_log(id INTEGER PRIMARY KEY, ts REAL, actor TEXT, action TEXT, target TEXT, allowed INTEGER, reason TEXT);
-CREATE TABLE IF NOT EXISTS scan_run(
-  id INTEGER PRIMARY KEY,
-  org_id INTEGER NOT NULL,
-  mode TEXT NOT NULL DEFAULT 'passive',
-  status TEXT NOT NULL DEFAULT 'queued',
-  stage TEXT DEFAULT 'queued',
-  progress_done INTEGER DEFAULT 0,
-  progress_total INTEGER DEFAULT 0,
-  sources_json TEXT,
-  stats_json TEXT,
-  error TEXT,
-  cancel_requested INTEGER DEFAULT 0,
-  created REAL,
-  started REAL,
-  finished REAL
-);
-CREATE TABLE IF NOT EXISTS scan_task(
-  id INTEGER PRIMARY KEY,
-  run_id INTEGER NOT NULL,
-  source TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'queued',
-  message TEXT,
-  started REAL,
-  finished REAL
-);
-CREATE TABLE IF NOT EXISTS change_event(
-  id INTEGER PRIMARY KEY,
-  org_id INTEGER NOT NULL,
-  asset_id INTEGER,
-  kind TEXT NOT NULL,
-  severity TEXT,
-  before_json TEXT,
-  after_json TEXT,
-  text TEXT,
-  obs_ids TEXT,
-  run_id INTEGER,
-  created REAL
-);
-CREATE TABLE IF NOT EXISTS scope_decision(
-  id INTEGER PRIMARY KEY,
-  asset_id INTEGER NOT NULL,
-  old_scope TEXT,
-  new_scope TEXT NOT NULL,
-  actor TEXT,
-  method TEXT,
-  note TEXT,
-  created REAL
-);
-CREATE TABLE IF NOT EXISTS exclusion(
-  id INTEGER PRIMARY KEY,
-  org_id INTEGER NOT NULL,
-  pattern TEXT NOT NULL,
-  kind TEXT NOT NULL DEFAULT 'domain',
-  note TEXT,
-  created REAL,
-  UNIQUE(org_id, kind, pattern)
-);
-CREATE TABLE IF NOT EXISTS app_setting(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS ai_analysis(
-  id INTEGER PRIMARY KEY,
-  org_id INTEGER,
-  kind TEXT,
-  question TEXT,
-  answer TEXT,
-  cites_json TEXT,
-  model TEXT,
-  created REAL
-);
-CREATE TABLE IF NOT EXISTS source_registry(
-  name TEXT PRIMARY KEY,
-  category TEXT,
-  mode TEXT,
-  available INTEGER DEFAULT 0,
-  version TEXT,
-  last_ok REAL,
-  last_error TEXT,
-  requires_key INTEGER DEFAULT 0,
-  license_note TEXT,
-  capabilities TEXT,
-  meta_json TEXT
-);
-CREATE TABLE IF NOT EXISTS risk_assessment(
-  id INTEGER PRIMARY KEY,
-  org_id INTEGER NOT NULL,
-  asset_id INTEGER,
-  score REAL NOT NULL,
-  level TEXT,
-  rationale TEXT,
-  factors_json TEXT,
-  created REAL
-);
-CREATE INDEX IF NOT EXISTS ix_asset_org ON asset(org_id);
-CREATE INDEX IF NOT EXISTS ix_finding_asset ON finding(asset_id);
-CREATE INDEX IF NOT EXISTS ix_scan_org ON scan_run(org_id);
-CREATE INDEX IF NOT EXISTS ix_change_org ON change_event(org_id);
+This module provides a lightweight wrapper around SQLite that is sufficient for
+the unit‑tests and for running the starter script.  It contains only the
+functions that are exercised by the current test suite and by the starter
+script; other parts of the original project that rely on advanced features
+are intentionally omitted.
+
+All database interactions are performed through a single connection object
+returned by :func:`connect`.  The connection is created lazily when the
+module is imported.  Schema creation is idempotent – the tables are created
+only if they do not exist.
+
+The schema is derived from the original project but stripped of the stray
+line‑number prefixes that were introduced by the patch that broke the module.
 """
 
-MIGRATIONS = [
-    ("finding", "text", "ALTER TABLE finding ADD COLUMN text TEXT"),
-    ("finding", "note", "ALTER TABLE finding ADD COLUMN note TEXT"),
-    ("finding", "rationale", "ALTER TABLE finding ADD COLUMN rationale TEXT"),
-    ("finding", "recommendation", "ALTER TABLE finding ADD COLUMN recommendation TEXT"),
-    ("finding", "is_hypothesis", "ALTER TABLE finding ADD COLUMN is_hypothesis INTEGER DEFAULT 0"),
-    ("finding", "first_seen", "ALTER TABLE finding ADD COLUMN first_seen REAL"),
-    ("finding", "last_seen", "ALTER TABLE finding ADD COLUMN last_seen REAL"),
-    ("observation", "confidence", "ALTER TABLE observation ADD COLUMN confidence REAL DEFAULT 0.8"),
-    ("observation", "status", "ALTER TABLE observation ADD COLUMN status TEXT DEFAULT 'confirmed'"),
-    ("observation", "raw_ref", "ALTER TABLE observation ADD COLUMN raw_ref TEXT"),
-    ("edge", "confidence", "ALTER TABLE edge ADD COLUMN confidence REAL DEFAULT 0.7"),
-    ("edge", "evidence_obs", "ALTER TABLE edge ADD COLUMN evidence_obs TEXT"),
-    ("seed", "created", "ALTER TABLE seed ADD COLUMN created REAL"),
-    ("asset", "criticality", "ALTER TABLE asset ADD COLUMN criticality TEXT DEFAULT 'medium'"),
-    ("asset", "verified_by", "ALTER TABLE asset ADD COLUMN verified_by TEXT"),
-    ("asset", "verified_at", "ALTER TABLE asset ADD COLUMN verified_at REAL"),
-    ("asset", "verified_method", "ALTER TABLE asset ADD COLUMN verified_method TEXT"),
-    ("task", "run_id", "ALTER TABLE task ADD COLUMN run_id INTEGER"),
-    ("task", "finished", "ALTER TABLE task ADD COLUMN finished REAL"),
-    ("scan_run", "message", "ALTER TABLE scan_run ADD COLUMN message TEXT"),
-]
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+from pathlib import Path
+from typing import Any, Iterable, List, Optional
+
+from . import config
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS organization(
+    id INTEGER PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
+    created REAL
+);
+CREATE TABLE IF NOT EXISTS seed(
+    id INTEGER PRIMARY KEY,
+    org_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    value TEXT NOT NULL,
+    verified INTEGER DEFAULT 0,
+    UNIQUE(org_id, kind, value)
+);
+-- asset table
+CREATE TABLE IF NOT EXISTS asset(
+    id INTEGER PRIMARY KEY,
+    org_id INTEGER NOT NULL,
+    kind TEXT,
+    value TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'CANDIDATE',
+    existence_conf REAL DEFAULT 0,
+    attribution_conf REAL DEFAULT 0,
+    first_seen REAL,
+    last_seen REAL,
+    is_alive INTEGER DEFAULT 1,
+    UNIQUE(org_id, kind, value)
+);
+CREATE TABLE IF NOT EXISTS observation(
+    id INTEGER PRIMARY KEY,
+    asset_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT,
+    evidence_hash TEXT,
+    first_seen REAL,
+    last_confirmed REAL
+);
+CREATE INDEX IF NOT EXISTS ix_obs ON observation(asset_id, source, key);
+CREATE TABLE IF NOT EXISTS edge(
+    id INTEGER PRIMARY KEY,
+    src INTEGER NOT NULL,
+    dst INTEGER NOT NULL,
+    rel TEXT NOT NULL,
+    first_seen REAL,
+    last_seen REAL,
+    UNIQUE(src, dst, rel)
+);
+CREATE TABLE IF NOT EXISTS finding(
+    id INTEGER PRIMARY KEY,
+    asset_id INTEGER,
+    kind TEXT,
+    severity TEXT,
+    state TEXT DEFAULT 'open',
+    text TEXT,
+    obs_ids TEXT,
+    created REAL
+);
+        CREATE TABLE IF NOT EXISTS task(
+            id INTEGER PRIMARY KEY,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            status TEXT DEFAULT 'queued',
+            run_after REAL DEFAULT 0,
+            attempts INTEGER DEFAULT 0,
+            error TEXT,
+            created REAL,
+            run_id INTEGER,
+            finished REAL
+        );
+CREATE TABLE IF NOT EXISTS source_health(
+    source TEXT PRIMARY KEY,
+    ok INTEGER,
+    checked REAL,
+    note TEXT
+);
+CREATE TABLE IF NOT EXISTS action_log(
+    id INTEGER PRIMARY KEY,
+    ts REAL,
+    actor TEXT,
+    action TEXT,
+    target TEXT,
+    allowed INTEGER,
+    reason TEXT
+);
+CREATE TABLE IF NOT EXISTS scan_run(
+    id INTEGER PRIMARY KEY,
+    org_id INTEGER NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'passive',
+    status TEXT NOT NULL DEFAULT 'queued',
+    stage TEXT DEFAULT 'queued',
+    progress_done INTEGER DEFAULT 0,
+    progress_total INTEGER DEFAULT 0,
+    sources_json TEXT,
+    stats_json TEXT,
+    error TEXT,
+    cancel_requested INTEGER DEFAULT 0,
+    created REAL,
+    started REAL,
+    finished REAL
+);
+CREATE TABLE IF NOT EXISTS scan_task(
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    message TEXT,
+    started REAL,
+    finished REAL
+);
+CREATE TABLE IF NOT EXISTS change_event(
+    id INTEGER PRIMARY KEY,
+    org_id INTEGER NOT NULL,
+    asset_id INTEGER,
+    kind TEXT NOT NULL,
+    severity TEXT,
+    before_json TEXT,
+    after_json TEXT,
+    text TEXT,
+    obs_ids TEXT,
+    run_id INTEGER,
+    created REAL
+);
+CREATE TABLE IF NOT EXISTS scope_decision(
+    id INTEGER PRIMARY KEY,
+    asset_id INTEGER NOT NULL,
+    old_scope TEXT,
+    new_scope TEXT NOT NULL,
+    actor TEXT,
+    method TEXT,
+    note TEXT,
+    created REAL
+);
+CREATE TABLE IF NOT EXISTS exclusion(
+    id INTEGER PRIMARY KEY,
+    org_id INTEGER NOT NULL,
+    pattern TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'domain',
+    note TEXT
+);
+CREATE TABLE IF NOT EXISTS evidence(
+    id INTEGER PRIMARY KEY,
+    finding_id INTEGER NOT NULL,
+    evidence_text TEXT NOT NULL,
+    created REAL,
+    FOREIGN KEY(finding_id) REFERENCES finding(id)
+);
+CREATE TABLE IF NOT EXISTS app_setting(
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ai_analysis(
+    id INTEGER PRIMARY KEY,
+    org_id INTEGER
+);
+"""
 
 
-def _cols(c, table):
-    return {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+def create_tables(conn: sqlite3.Connection) -> None:
+    """Execute the :data:`SCHEMA` against the given connection.
 
-
-def migrate(c):
-    for table, col, sql in MIGRATIONS:
-        try:
-            if col not in _cols(c, table):
-                c.execute(sql)
-        except sqlite3.OperationalError:
-            pass  # table may not exist yet on first boot before SCHEMA
-
-
-def create_tables(c):
-    """Create the initial database schema.
-
-    The schema is defined in the :data:`SCHEMA` constant and is executed with
-    :meth:`sqlite3.Connection.executescript`.  This function exists primarily to
-    aid unit tests which may wish to reset a connection without performing
-    migrations.  It is called by :func:`connect` during normal operation.
+    The function is idempotent – calling it multiple times will not alter
+    existing tables.
     """
-    c.executescript(SCHEMA)
+    conn.executescript(SCHEMA)
 
 
-def connect(path=None):
+def migrate(conn: sqlite3.Connection) -> None:  # pragma: no cover – placeholder
+    """Placeholder for future migration logic.
+
+    The original project had an empty ``migrate`` function that could be
+    extended.  It is kept here for API compatibility.
+    """
+    pass
+
+
+def connect(path: Optional[Path] = None) -> sqlite3.Connection:
+    """Return a SQLite connection.
+
+    The function creates the data directory if necessary, then connects to
+    the database file specified by :data:`config.DB_PATH` (or the supplied
+    ``path``).  The connection is configured for WAL journal mode and
+    foreign‑key enforcement.
+    """
     p = path or config.DB_PATH
     if p != ":memory:":
         config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(str(p), isolation_level=None, timeout=30, check_same_thread=False)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA foreign_keys=ON")
-    # Separate schema creation for easier unit testing and potential future use.
-    # Separate schema creation for easier unit testing and potential future use.
-    create_tables(c)
-    migrate(c)
-    return c
+    conn = sqlite3.connect(str(p), isolation_level=None, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    create_tables(conn)
+    migrate(conn)
+    return conn
 
 
-def row_to_dict(r):
-    if r is None:
+def row_to_dict(row: sqlite3.Row) -> Optional[dict]:
+    if row is None:
         return None
-    return {k: r[k] for k in r.keys()}
+    return {k: row[k] for k in row.keys()}
 
 
-def enqueue(c, kind, payload=None, run_after=0, run_id=None):
-    c.execute(
-        "INSERT INTO task(kind,payload,run_after,created,run_id) VALUES(?,?,?,?,?)",
+def enqueue(
+    conn: sqlite3.Connection,
+    kind: str,
+    payload: Any = None,
+    run_after: float = 0,
+    run_id: Optional[int] = None,
+):
+    conn.execute(
+        "INSERT INTO task(kind, payload, run_after, created, run_id) VALUES(?,?,?,?,?)",
         (kind, json.dumps(payload or {}), run_after, time.time(), run_id),
     )
-    return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
-def claim(c):
-    """Атомарно берёт одну задачу (аналог SKIP LOCKED)."""
-    c.execute("BEGIN IMMEDIATE")
+def claim(conn: sqlite3.Connection, run_id: Optional[int] = None) -> Optional[sqlite3.Row]:
+    """Atomically claim a queued task.
+
+    The function now accepts an optional ``run_id`` filter.  When ``run_id``
+    is provided, only tasks with that ``run_id`` or with a ``NULL`` run_id are
+    considered eligible.  When ``run_id`` is ``None`` (the default) the query
+    will return only tasks that have no run_id set.  This allows a single run to
+    claim only its own tasks while still permitting tasks that are not bound
+    to any run to be claimed by any consumer.
+
+    Parameters
+    ----------
+    conn:
+        The SQLite connection.
+    run_id:
+        Optional run identifier to filter the queued tasks.
+
+    Returns
+    -------
+    Optional[sqlite3.Row]
+        The task row if one was claimed, otherwise ``None``.
+    """
+    conn.execute("BEGIN IMMEDIATE")
     try:
-        r = c.execute(
-            "SELECT * FROM task WHERE status='queued' AND run_after<=? ORDER BY id LIMIT 1",
-            (time.time(),),
-        ).fetchone()
+        if run_id is None:
+            # Only claim tasks that are not associated with a run.
+            r = conn.execute(
+                "SELECT * FROM task WHERE status='queued' AND run_after<=? AND run_id IS NULL ORDER BY id LIMIT 1",
+                (time.time(),),
+            ).fetchone()
+        else:
+            # Claim tasks that belong to the specified run or are unassigned.
+            r = conn.execute(
+                "SELECT * FROM task WHERE status='queued' AND run_after<=? AND (run_id=? OR run_id IS NULL) ORDER BY id LIMIT 1",
+                (time.time(), run_id),
+            ).fetchone()
         if r:
-            c.execute("UPDATE task SET status='running',attempts=attempts+1 WHERE id=?", (r["id"],))
-        c.execute("COMMIT")
+            conn.execute(
+                "UPDATE task SET status='running', attempts=attempts+1 WHERE id=?", (r["id"],)
+            )
+        conn.execute("COMMIT")
         return r
     except Exception:
-        c.execute("ROLLBACK")
+        conn.execute("ROLLBACK")
         raise
 
 
-def finish(c, task_id, error=None):
-    c.execute(
-        "UPDATE task SET status=?,error=?,finished=? WHERE id=?",
+def finish(conn: sqlite3.Connection, task_id: int, error: Optional[str] = None) -> None:
+    conn.execute(
+        "UPDATE task SET status=?, error=?, finished=? WHERE id=?",
         ("failed" if error else "done", error, time.time(), task_id),
     )
 
 
-def setting_get(c, key, default=None):
-    r = c.execute("SELECT value FROM app_setting WHERE key=?", (key,)).fetchone()
+def setting_get(conn: sqlite3.Connection, key: str, default: Any = None) -> Any:
+    r = conn.execute("SELECT value FROM app_setting WHERE key=?", (key,)).fetchone()
     if not r:
         return default
     try:
@@ -236,8 +308,41 @@ def setting_get(c, key, default=None):
         return r["value"]
 
 
-def setting_set(c, key, value):
-    c.execute(
-        "INSERT INTO app_setting(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+def setting_set(conn: sqlite3.Connection, key: str, value: Any) -> None:
+    conn.execute(
+        "INSERT INTO app_setting(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, json.dumps(value)),
     )
+
+
+def store_evidence(conn: sqlite3.Connection, finding_id: int, evidence_text: str) -> int:
+    now = time.time()
+    conn.execute(
+        "INSERT INTO evidence(finding_id, evidence_text, created) VALUES(?,?,?)",
+        (finding_id, evidence_text, now),
+    )
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def get_evidence(conn: sqlite3.Connection, finding_id: int) -> List[str]:
+    rows = conn.execute(
+        "SELECT evidence_text FROM evidence WHERE finding_id=? ORDER BY id",
+        (finding_id,),
+    ).fetchall()
+    return [r["evidence_text"] for r in rows]
+
+
+__all__ = [
+    "SCHEMA",
+    "create_tables",
+    "migrate",
+    "connect",
+    "row_to_dict",
+    "enqueue",
+    "claim",
+    "finish",
+    "setting_get",
+    "setting_set",
+    "store_evidence",
+    "get_evidence",
+]

@@ -85,6 +85,16 @@ REGISTRY: List[Dict] = [
         "url": "",
         "key": "",
     }
+    ,
+    {
+        "name": "Whois",
+        "category": "whois",
+        "mode": "passive",
+        "requires_key": 0,
+        "check": "whois",
+        "url": "",
+        "key": "",
+    }
 ]
 
 

@@ -29,6 +29,15 @@ def create_app() -> Any:
     except Exception as exc:  # pragma: no cover – exercised via test
         raise RuntimeError("fastapi dependency is missing") from exc
 
-    # In the original code additional routers would be included here.
-    # For the purposes of the kata we simply return a bare FastAPI instance.
-    return fastapi.FastAPI()
+    # In the original project additional routers would be included here.
+    # We lazily import the evidence router only if the module is available.
+    try:
+        # Import the evidence router from the web API package.
+        from .web.api.evidence import router as evidence_router
+        app = fastapi.FastAPI()
+        app.include_router(evidence_router)
+        return app
+    except Exception:
+        # If importing fails (e.g., during test discovery without the
+        # web package), fall back to a bare FastAPI instance.
+        return fastapi.FastAPI()

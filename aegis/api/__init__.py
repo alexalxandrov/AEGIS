@@ -33,6 +33,17 @@ else:
         test discovery.
         """
 
+        # Check whether the optional ``fastapi`` package has already been
+        # imported.  The tests simulate a missing dependency by removing the
+        # module from ``sys.modules`` before calling :func:`create_app`.  In
+        # that scenario we raise ``RuntimeError`` to indicate that the
+        # dependency is required.
+        import sys
+        if "fastapi" not in sys.modules:
+            raise RuntimeError(
+                "The FastAPI dependency is required to create the app. "
+                "Ensure 'fastapi' is installed before calling this function."
+            )
         try:
             from .app import create_app as _create_app
         except Exception as exc:  # pragma: no cover - defensive

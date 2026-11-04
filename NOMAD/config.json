@@ -1,0 +1,35 @@
+{
+  "bind": "127.0.0.1",
+  "port": 8765,
+  "auto_start": false,
+  "poll_interval_seconds": 1200,
+  "request_spacing_seconds": 1.25,
+  "observe_egress_ip": true,
+  "seeds": [
+    "1.1.1.1",
+    "8.8.8.8",
+    "9.9.9.9"
+  ],
+  "traceroute": {
+    "enabled": false,
+    "approved_targets": [],
+    "max_hops": 8,
+    "interval_seconds": 3600,
+    "timeout_seconds": 16
+  },
+  "discovery_interval_seconds": 30,
+  "asn_refresh_interval_seconds": 3600,
+  "ping": {
+    "enabled": false,
+    "approved_targets": [],
+    "interval_seconds": 30,
+    "timeout_seconds": 8
+  },
+  "arp_scan": {
+    "enabled": false,
+    "approved_subnets": [],
+    "interface": "",
+    "interval_seconds": 3600,
+    "timeout_seconds": 25
+  }
+}

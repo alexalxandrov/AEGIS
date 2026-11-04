@@ -20,7 +20,17 @@ import subprocess
 import shutil
 from typing import Dict, List
 
-__all__ = ["run_network_scan", "detect_subnet", "scan_subnet"]
+__all__ = [
+    "run_network_scan",
+    "detect_subnet",
+    "scan_subnet",
+    "run_scan",  # new orchestrator
+    "subfinder_scan",
+    "nmap_scan",
+    "sslscan_scan",
+    "dns_records_scan",
+    "traceroute_scan",
+]
 
 
 def _which(tool: str) -> Path | None:
@@ -187,3 +197,178 @@ def scan_subnet(subnet: str, max_hosts: int | None = None, timeout: int | None =
     for host in truncated.hosts():
         results.extend(run_network_scan(str(host), timeout=timeout))
     return results
+
+
+# ---------------------------------------------------------------------------
+#  NEW: Helper functions for advanced reconnaissance
+# ---------------------------------------------------------------------------
+def _run_tool(tool: str, args: list[str], timeout: int | None = None) -> str:
+    """Run an external command and return its stdout.
+
+    If the executable is missing, an empty string is returned.  Errors are
+    silently swallowed so that optional scanners do not break the entire
+    pipeline.  ``AEGIS_DEBUG`` can be set to emit diagnostic output.
+    """
+    if not _which(tool):  # pragma: no cover – optional tool
+        return ""
+    cmd = [tool] + args
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:  # pragma: no cover – defensive
+        raise RuntimeError(f"{tool} timed out after {timeout} seconds") from exc
+    if result.returncode != 0:
+        if os.getenv("AEGIS_DEBUG"):
+            print(f"[DEBUG] {tool} returned non‑zero rc={result.returncode}")
+            print("stdout:\n", result.stdout)
+            print("stderr:\n", result.stderr)
+        return ""
+    return result.stdout
+
+
+def subfinder_scan(target: str, timeout: int | None = None) -> list[dict[str, str]]:
+    """Discover subdomains using *subfinder*.
+
+    Returns a list of dictionaries containing the discovered subdomain and
+    the original *target*.
+    """
+    output = _run_tool("subfinder", ["-silent", "-d", target, "-oJ"], timeout)
+    if not output:
+        return []
+    results: list[dict[str, str]] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        results.append({"target": target, "subdomain": entry.get("domain", "")})
+    return results
+
+
+def nmap_scan(target: str, timeout: int | None = None) -> list[dict[str, str]]:
+    """Perform a lightweight Nmap service scan.
+
+    Parses the XML output into a list of port/service dictionaries.
+    """
+    output = _run_tool("nmap", ["-sV", "-oX", "-", target], timeout)
+    if not output:
+        return []
+    scans: list[ScanResult] = []
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(output)
+    except Exception:  # pragma: no cover – defensive
+        return []
+    for host in root.findall("./host"):
+        for port in host.findall("./ports/port"):
+            portid = port.get("portid")
+            state = (
+                port.find("state").get("state") if port.find("state") is not None else "unknown"
+            )
+            service_elem = port.find("service")
+            svc_name = service_elem.get("name") if service_elem is not None else ""
+            scans.append(
+                ScanResult(
+                    target=target,
+                    port=str(portid),
+                    state=state,
+                    service=svc_name,
+                )
+            )
+    return [s.__dict__ for s in scans]
+
+
+def sslscan_scan(target: str, timeout: int | None = None) -> list[dict[str, str]]:
+    """Extract SSL/TLS certificate information.
+
+    Returns a list with a single dictionary containing the common name,
+    issuer and expiry date.  If the tool is missing or the output cannot be
+    parsed, an empty list is returned.
+    """
+    output = _run_tool("sslscan", ["--no-failed", target], timeout)
+    if not output:
+        return []
+    cn = issuer = expires = ""
+    for line in output.splitlines():
+        if line.startswith("Common Name:"):
+            cn = line.split(":", 1)[1].strip()
+        elif line.startswith("Issuer:"):
+            issuer = line.split(":", 1)[1].strip()
+        elif line.startswith("Expires:"):
+            expires = line.split(":", 1)[1].strip()
+        if cn and issuer and expires:
+            break
+    if not (cn and issuer and expires):
+        return []
+    return [{"target": target, "common_name": cn, "issuer": issuer, "expires": expires}]
+
+
+def dns_records_scan(target: str, timeout: int | None = None) -> list[dict[str, str]]:
+    """Retrieve DNS records for *target* via ``dig``.
+
+    Parses the answer section and returns a list of dictionaries with the
+    record type and value.
+    """
+    output = _run_tool("dig", ["+nocmd", "+noall", "+answer", target], timeout)
+    if not output:
+        return []
+    records: list[dict[str, str]] = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        name, ttl, cls, rtype, value = parts[:5]
+        records.append({"name": name, "type": rtype, "value": value})
+    return records
+
+
+def traceroute_scan(target: str, timeout: int | None = None) -> list[dict[str, str]]:
+    """Perform a traceroute and return hop information.
+
+    Each hop is represented as a dictionary with the hop number and IP.
+    """
+    output = _run_tool("traceroute", ["-n", target], timeout)
+    if not output:
+        return []
+    hops: list[dict[str, str]] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith("traceroute"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        hop = parts[0]
+        ip = parts[1]
+        hops.append({"hop": hop, "ip": ip})
+    return hops
+
+
+def run_scan(target: str, run_id: int | None = None, timeout: int | None = None) -> list[dict[str, str]]:
+    """Orchestrate all advanced network reconnaissance methods.
+
+    The function aggregates results from the sub‑tools, annotates each entry
+    with a ``source`` key and optionally attaches a ``run_id``.
+    """
+    all_results: list[dict[str, str]] = []
+    for entry in subfinder_scan(target, timeout):
+        entry["source"] = "subfinder"
+        all_results.append(entry)
+    for entry in nmap_scan(target, timeout):
+        entry["source"] = "nmap"
+        all_results.append(entry)
+    for entry in sslscan_scan(target, timeout):
+        entry["source"] = "sslscan"
+        all_results.append(entry)
+    for entry in dns_records_scan(target, timeout):
+        entry["source"] = "dig"
+        all_results.append(entry)
+    for entry in traceroute_scan(target, timeout):
+        entry["source"] = "traceroute"
+        all_results.append(entry)
+    if run_id is not None:
+        for entry in all_results:
+            entry["run_id"] = run_id
+    return all_results
