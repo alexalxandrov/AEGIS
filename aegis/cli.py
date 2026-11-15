@@ -1,7 +1,7 @@
 import argparse, json, sys, urllib.request, socket
 # Import uvicorn lazily in cmd_serve to avoid a hard dependency when the
 # command is not used (e.g., during unit tests).
-from . import config, db, scope, __version__, ai_analyst, ai_advanced
+from . import config, db, scope, __version__, ai_analyst, ai_advanced, runner
 
 def cmd_init(a):
     c = db.connect(); print("БД готова:", config.DB_PATH)
@@ -148,6 +148,25 @@ def cmd_watch(a):
         try: time.sleep(a.every * 3600)
         except KeyboardInterrupt: print("\n[watch] стоп"); return
 
+# ----------------------------------------------------------------------
+# New orchestrator command – loads a JSON plan and executes it
+# ----------------------------------------------------------------------
+def cmd_orchestrate(a):
+    """Run an orchestrator plan.
+
+    The plan file must be a JSON document describing a sequence of steps.
+    The command simply delegates to :class:`aegis.orchestrator.Orchestrator`.
+    """
+    from .orchestrator import Orchestrator
+
+    orchestrator = Orchestrator()
+    orchestrator.load_plan(a.plan)
+    # Register minimal modules that are useful for unit tests.
+    # Pass ``db.connect()`` where a module needs database access.
+    orchestrator.register("run_org", lambda **kw: runner.run_org(db.connect(), kw["org"], limit=kw.get("limit"), brute=kw.get("brute")))
+    orchestrator.register("probe_org", lambda **kw: runner.probe_org(db.connect(), kw["org"]))
+    orchestrator.run()
+
 def cmd_baseline(a):
     from . import diff
     c = db.connect(); o = c.execute("SELECT id FROM organization WHERE name=?", (a.org,)).fetchone()
@@ -189,6 +208,8 @@ def main():
     x = s.add_parser("digest"); x.add_argument("org"); x.add_argument("--hours", type=float, default=48); x.add_argument("--no-llm", action="store_true"); x.set_defaults(f=cmd_digest)
     x = s.add_parser("scan"); x.add_argument("org"); x.add_argument("--hours", type=float, default=48); x.add_argument("--limit", type=int, default=300); x.add_argument("--no-llm", action="store_true"); x.add_argument("--brute", action="store_true"); x.set_defaults(f=cmd_scan)
     x = s.add_parser("watch"); x.add_argument("org"); x.add_argument("--every", type=float, default=6); x.add_argument("--no-llm", action="store_true"); x.set_defaults(f=cmd_watch)
+    # --- orchestrator command --------------------------------------------
+    x = s.add_parser("orchestrate"); x.add_argument("--plan", required=True, help="JSON plan file to execute"); x.set_defaults(f=cmd_orchestrate)
     # --- new AI command --------------------------------------------
     ai_parser = s.add_parser("ai")
     ai_parser.add_argument("org", help="Organisation name or ID")

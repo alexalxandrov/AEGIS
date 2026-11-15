@@ -31,8 +31,8 @@ from aegis.tentacles import dns
 from aegis.tentacles import email as email_tentacle
 from aegis import config
 from aegis.tentacles import wayback
- from aegis.tentacles import web as web_tentacle
- from aegis.wordlist import WORDS
+from aegis.tentacles import web as web_tentacle
+from aegis.wordlist import WORDS
 # Additional stubs for the expanded feature set
 from aegis.tentacles import ti, passive_dns, whois, webscan, shodan, cve, subdomain
 import shutil

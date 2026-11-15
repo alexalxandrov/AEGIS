@@ -29,7 +29,7 @@ from typing import Any, Optional
 
 import time
 
-from aegis import config, db, sources, ai_analyst
+from aegis import config, db, sources, ai_analyst, runner
 # Network scan utilities removed per user request
 import xml.etree.ElementTree as ET
 import json
@@ -214,7 +214,12 @@ parser = argparse.ArgumentParser(description="Bootstrap AEGIS environment")
 # default organization named "default".  This change keeps backward
 # compatibility for existing callers that explicitly provide an org.
 parser.add_argument("--org", help="Organization name or ID", default="default")
-parser.add_argument("target", help="Target IP, hostname or URL")
+# ``target`` is a positional argument, but historically it was required.
+# In many automated or CI scenarios a target may not be supplied, so we
+# make it optional with a sensible default of ``localhost``.
+# The target can be a single IP/hostname or a CIDR subnet (e.g. 192.168.0.0/24)
+parser.add_argument("target", nargs="?", default="localhost",
+                    help="Target IP, hostname, URL, or CIDR subnet (default: localhost)")
 parser.add_argument("--limit", type=int, help="Maximum number of assets to scan")
 parser.add_argument("--no-wayback", action="store_true", help="Skip Wayback Machine queries")
 parser.add_argument("--output-dir", help="Custom output directory (default: timestamped run folder)")
@@ -337,34 +342,30 @@ def main(args: argparse.Namespace) -> None:
         )
         c.execute(
             "INSERT OR IGNORE INTO asset(org_id,kind,value,scope,first_seen,last_seen) VALUES(?,?,?,?,strftime('%s','now'),strftime('%s','now'))",
-            (org_id, kind, target, "verified" if kind == "domain" else "candidate"),
-        )
-        # Removed legacy IP seeding block
-
-    # Run a lightweight scan (seed scan)
-    try:
-        from aegis import runner
-        print("\nRunning initial seed scan (may take a few seconds)...")
-        runner.run_org(
-            c,
-            args.org,
-            limit=args.limit,
-            brute=False,
-            wb=not args.no_wayback,
-        )
-    except Exception as e:  # pragma: no cover – scan errors are user‑visible
-        print("Error during seed scan:", e)
-
-    # --- Full network reconnaissance -----------------------------------
-    print("\nЗапускаю полную сетевую разведку…")
-    try:
-        from aegis.tentacles.network_scan import run_network_scan
-        net_results = run_network_scan(args.target, timeout=120)
-    except Exception as e:
-        print("Не удалось выполнить сетевой скан: ", e)
-        net_results = []
-
-    # Persist scan results to the scan directory for later analysis
+349 |     # Run a lightweight scan (seed scan)
+350 |     try:
+351 |         from aegis import runner
+352 |         print("\nRunning initial seed scan (may take a few seconds)...")
+353 |         conn = db.connect()
+354 |         org_name = "default-org"
+355 |         runner.run_org(conn, org_name)
+356 |     except Exception as e:  # pragma: no cover – scan errors are user‑visible
+357 |         print("Error during seed scan:", e)
+358 | 
+359 |     # --- Full network reconnaissance -----------------------------------
+360 |     try:
+361 |         from aegis.tentacles.network_scan import run_network_scan
+362 |         net_results = run_network_scan(args.target, timeout=120)
+363 |         # Убираем дубли, чтобы лог был чище и не вводил в заблуждение.
+364 |         unique = {}
+365 |         for entry in net_results:
+366 |             key = (entry.get("target"), entry.get("port"), entry.get("state"), entry.get("service", ""))
+367 |             if key not in unique:
+368 |                 unique[key] = entry
+369 |         net_results = list(unique.values())
+370 |     except Exception as e:
+371 |         print("Не удалось выполнить сетевой скан: ", e)
+372 |         net_results = []
     net_log_path = workspace / f"network_scan.log"
     with open(net_log_path, "w", encoding="utf-8") as f:
         f.write(json.dumps(net_results, indent=2, ensure_ascii=False))
@@ -418,6 +419,29 @@ def main(args: argparse.Namespace) -> None:
     # The original quick‑summary block is omitted to avoid duplicate AI calls.
 
     print("\nDone.")
+    # ---------------------------------------------------------------------------
+    # Optional orchestrator run – if a plan named ``plan.json`` exists in the
+    # current working directory, load and execute it.  This mimics the behaviour
+    # of the CLI ``orchestrate`` subcommand but is invoked automatically from
+    # the starter script.  The plan is expected to be a JSON file that
+    # describes a sequence of orchestrator steps.  If the file is absent the
+    # starter proceeds without invoking the orchestrator.
+    # ---------------------------------------------------------------------------
+    plan_path = Path.cwd() / "plan.json"
+    if plan_path.exists():
+        try:
+            from aegis.orchestrator import Orchestrator
+            import aegis.runner as runner
+            print("\nOrchestrator plan found, executing...")
+            orchestrator = Orchestrator()
+            orchestrator.load_plan(str(plan_path))
+            orchestrator.register("run_org", lambda **kw: runner.run_org(db.connect(), kw["org"], limit=kw.get("limit"), brute=kw.get("brute")))
+            orchestrator.register("probe_org", lambda **kw: runner.probe_org(db.connect(), kw["org"]))
+            orchestrator.run()
+            print("Orchestrator execution completed.")
+        except Exception as e:  # pragma: no cover - guard against unexpected errors
+            print(f"Failed to execute orchestrator: {e}")
+
     # ---------------------------------------------------------------------------
     # Automatically launch the FastAPI web server after the starter finishes.
     # ---------------------------------------------------------------------------
