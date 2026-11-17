@@ -13,7 +13,7 @@ import unittest
 from types import SimpleNamespace
 from functools import wraps
 
-    def _skipif(condition: bool, reason: str = ""):
+def _skipif(condition: bool, reason: str = ""):
     """Return a decorator that does nothing.
 
     Parameters
@@ -24,12 +24,12 @@ from functools import wraps
         Optional reason string – retained for compatibility.
     """
 
-        def decorator(func):
-            # If the condition is True, use unittest.skip to skip the test.
-            if condition:
-                return unittest.skip(reason)(func)
-            # Otherwise just return the original function unchanged.
-            return func
+    def decorator(func):
+        # If the condition is True, use unittest.skip to skip the test.
+        if condition:
+            return unittest.skip(reason)(func)
+        # Otherwise just return the original function unchanged.
+        return func
 
     return decorator
 
@@ -39,6 +39,7 @@ mark = SimpleNamespace(skipif=_skipif)
 # ``fixture`` decorator – simply returns the wrapped function.
 def _fixture(func):
     return func
+fixture = _fixture
 
 # ``raises`` context manager – behaves like ``contextlib.contextmanager``
 # that simply yields.  It is used to assert exceptions in tests.

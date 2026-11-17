@@ -27,7 +27,7 @@ import time
 
 import aegis.store as store
 import aegis.sources as sources
-from aegis.tentacles import dns
+from aegis.tentacles import dns, ct, email, web
 from aegis.tentacles import email as email_tentacle
 from aegis import config
 from aegis.tentacles import wayback
@@ -192,6 +192,15 @@ def _run_source_checks(
                     stats["obs_new"] += 1
         except Exception as e:  # pragma: no cover - defensive
             logger.exception("DOM probe failed for %s: %s", value, e)
+# -- CT callback -------------------------------------------------------
+        if ct_fn:
+            try:
+                ct_res = ct_fn(conn, asset)
+                for item in ct_res:
+                    _observe(conn, asset_id, "ct", item.get("key"), item.get("value"))
+                    stats["obs_new"] += 1
+            except Exception as e:  # pragma: no cover - defensive
+                logger.exception("CT probe failed: %s", e)
     # -- Email check --------------------------------------------------------
     if email_fn:
         try:
@@ -320,8 +329,8 @@ def run_org(
     total_stats: Dict[str, int] = {"obs_new": 0, "assets_new": 0}
     for asset_row in assets:
         asset_id, kind, value, asset_scope = asset_row["id"], asset_row["kind"], asset_row["value"], asset_row["scope"]
-        if asset_scope != 1:
-            continue
+        if asset_scope != "VERIFIED":
+                continue
         if kind != "domain":
             continue
         stats = _run_source_checks(
