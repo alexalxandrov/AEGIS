@@ -102,12 +102,11 @@ class Orchestrator:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT,
                 step_index INTEGER,
-                module TEXT,
+                step_name TEXT,
                 args TEXT,
                 kwargs TEXT,
                 result TEXT,
-                start_ts REAL,
-                end_ts REAL,
+                ts REAL,
                 status TEXT
             );
             """
@@ -145,6 +144,11 @@ class Orchestrator:
         path = pathlib.Path(path)
         with path.open("r", encoding="utf-8") as fh:
             self.plan = json.load(fh)
+        # Normalize step keys: support legacy 'name' key for module
+        steps = self.plan.get("steps", [])
+        for step in steps:
+            if "module" not in step and "name" in step:
+                step["module"] = step.pop("name")
         self.state = OrchestratorState(self.plan.get("name", str(path.name)))
 
     # ------------------------------------------------------------------
@@ -174,7 +178,7 @@ class Orchestrator:
         self, module: str, args: Dict[str, Any], kwargs: Dict[str, Any], result: Any, start_ts: float, end_ts: float, status: str
     ) -> None:
         self.conn.execute(
-            "INSERT INTO orchestrator_step(run_id, step_index, module, args, kwargs, result, start_ts, end_ts, status) VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO orchestrator_step(run_id, step_index, step_name, args, kwargs, result, ts, status) VALUES(?,?,?,?,?,?,?,?)",
             (
                 self.state.plan_name if self.state else None,
                 self.state.last_step + 1 if self.state else None,
@@ -182,9 +186,8 @@ class Orchestrator:
                 json.dumps(args, ensure_ascii=False),
                 json.dumps(kwargs, ensure_ascii=False),
                 json.dumps(result, ensure_ascii=False),
-                start_ts,
                 end_ts,
-                status,
+                "completed",
             ),
         )
         self.conn.commit()

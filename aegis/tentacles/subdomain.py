@@ -1,28 +1,37 @@
-"""Subdomain hunter – stub.
+"""Subdomain enumeration using crt.sh.
+
+The `hunt(domain)` function returns a list of discovered subdomains
+for *domain* by querying the public crt.sh service and parsing the JSON
+response.  The result is sorted and de‑duplicated.
 """
 
-from __future__ import annotations
-
+import httpx
 import logging
-from typing import List
 
 logger = logging.getLogger("aegis.tentacles.subdomain")
 
-# Public API for the subdomain hunter.
-# Historically the module exposed a ``subdomain`` symbol for backward
-# compatibility, but the actual implementation is the ``hunt`` function.
-# We keep ``hunt`` as the preferred name and provide ``subdomain`` as an
-# alias to satisfy existing imports.
 __all__ = ["hunt", "subdomain"]
 
+def hunt(domain: str):
+    """Return a list of discovered subdomains for *domain*."""
+    try:
+        url = f"https://crt.sh/?q=%25.{domain}&output=json"
+        resp = httpx.get(url, timeout=20)
+        if resp.status_code != 200:
+            logger.warning("crt.sh returned %s for %s", resp.status_code, domain)
+            return []
+        data = resp.json()
+        subs = set()
+        for entry in data:
+            name_value = entry.get("name_value", "")
+            for name in name_value.splitlines():
+                name = name.strip().lower()
+                if name.endswith("." + domain) or name == domain:
+                    subs.add(name.rstrip("."))
+        return sorted(subs)
+    except Exception as exc:
+        logger.warning("subdomain hunt error for %s: %s", domain, exc)
+        return []
 
-def hunt(domain: str) -> List[str]:
-    """Return a list of discovered subdomains for *domain*.
-
-    Stub – logs a warning and returns an empty list.
-    """
-    logger.warning("Subdomain hunt stub called for %s", domain)
-    return []
-
-# Alias for backward compatibility.
+# Backwards compatible alias
 subdomain = hunt
